@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 
-APP_VERSION = "v27-time-range"
+APP_VERSION = "v29-zero-f-reference"
 
 HOST = "127.0.0.1"
 PORT = 8765
@@ -5275,6 +5275,30 @@ function renderMeasurementChart(records) {
             point.setAttribute("r", "4"); point.setAttribute("fill", probeColor(records[0].probe));
             svg.appendChild(point);
         }
+    }
+
+    // Reference points follow the display unit and never expand the axis.
+    for (const reference of [
+        {name: "0°F reference", id: "zero-f", celsius: -160 / 9, color: "#7c3aed"},
+        {name: "Freezing", celsius: 0, color: "#0f766e"},
+        {name: "Boiling", celsius: 100, color: "#b45309"}
+    ]) {
+        const value = displayTemperature(reference.celsius);
+        if (!chartData.length || value < minTemp || value > maxTemp) continue;
+        const y = yForTemperature(value);
+        const line = addLine(left, y, width - right, y, reference.color, "7 5", "1.5");
+        line.setAttribute("data-reference", reference.id || reference.name.toLowerCase());
+        line.setAttribute("vector-effect", "non-scaling-stroke");
+        line.style.pointerEvents = "none";
+        const label = addText(width - right - 6, Math.max(top + 14, y - 7),
+            `${reference.name} · ${formatTemperature(reference.celsius)}`, "end", "12");
+        label.setAttribute("fill", reference.color);
+        label.setAttribute("font-weight", "700");
+        label.setAttribute("stroke", "#fff");
+        label.setAttribute("stroke-width", "4");
+        label.setAttribute("stroke-linejoin", "round");
+        label.setAttribute("paint-order", "stroke");
+        label.style.pointerEvents = "none";
     }
 
     const hoverLine = document.createElementNS(ns, "line");

@@ -83,6 +83,10 @@ it. Drag left or right across the chart to select a time range; double-click
 to zoom out. Zooming loads the corresponding readings from SQLite, including
 earlier sessions. Empty ranges retain the chart and navigation controls.
 
+Dashed reference lines mark 0 F (-17.8 C), water's freezing point (0 C / 32 F)
+and boiling point at standard pressure (100 C / 212 F) when they fall within
+the visible temperature scale. These markers do not expand the scale.
+
 The backend detects USB connections and downloads all available readings
 without any browser open. It checks connected loggers for additional samples
 at the configured sync interval (10 seconds by default). **Sync now** requests

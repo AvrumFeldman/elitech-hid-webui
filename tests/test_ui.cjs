@@ -81,6 +81,39 @@ assert.equal(element('measurementMin').textContent, '78.8 °F');
 assert.equal(element('measurementMax').textContent, '80.6 °F');
 const walkText = node => [node.textContent, ...node.children.flatMap(walkText)];
 assert(walkText(element('measurementChart')).some(text => text.includes('°F')));
+// Temperature reference lines convert with units, stay on the existing scale, and
+// remain absent in empty ranges or when all readings are far from a threshold.
+const chartNodes = node => [node, ...node.children.flatMap(chartNodes)];
+const referenceLines = () => chartNodes(element('measurementChart')).filter(node => node.attributes['data-reference']);
+const chartForTemperatures = values => context.renderMeasurementChart(values.map((temperature, i) => ({
+  ...data.records[i % data.records.length], temperature, index:i+1
+})));
+assert.equal(referenceLines().length, 0); // ordinary room temperature
+for (const [unit, freezing, boiling] of [['C', '0.0 °C', '100.0 °C'], ['F', '32.0 °F', '212.0 °F']]) {
+  element('displayUnit').value = unit;
+  chartForTemperatures([-2, 2]);
+  assert.deepEqual(referenceLines().map(line => line.attributes['data-reference']), ['freezing']);
+  assert(walkText(element('measurementChart')).some(text => text.includes(`Freezing · ${freezing}`)));
+  assert.equal(Number(referenceLines()[0].attributes.y1), 128); // halfway down the unchanged -2..2 C scale
+  chartForTemperatures([98, 102]);
+  assert.deepEqual(referenceLines().map(line => line.attributes['data-reference']), ['boiling']);
+  assert(walkText(element('measurementChart')).some(text => text.includes(`Boiling · ${boiling}`)));
+  chartForTemperatures([-1, 101]);
+  assert.equal(referenceLines().length, 2);
+  chartForTemperatures([0, 2]); // threshold exactly at the lower axis boundary
+  assert.equal(Number(referenceLines()[0].attributes.y1), 238);
+  chartForTemperatures([30, 40]);
+  assert.equal(referenceLines().length, 0);
+  chartForTemperatures([-20, -17]);
+  assert.deepEqual(referenceLines().map(line => line.attributes['data-reference']), ['zero-f']);
+  assert(walkText(element('measurementChart')).some(text => text.includes(unit === 'C' ? '−17.8' : '0.0 °F') || (unit === 'C' && text.includes('-17.8'))));
+  chartForTemperatures([-28.9, 21.5]); // screenshot: approximately -20 F to 70.7 F
+  assert.deepEqual(referenceLines().map(line => line.attributes['data-reference']), ['zero-f', 'freezing']);
+  chartForTemperatures([]);
+  assert.equal(referenceLines().length, 0);
+}
+element('displayUnit').value = 'F';
+context.renderMeasurements(data);
 context.exportMeasurementsCsv();
 exported.text().then(async csv => {
   assert(csv.includes('Temperature (°F)'));
