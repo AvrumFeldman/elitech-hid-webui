@@ -1,0 +1,38 @@
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+# Local credentials and editor settings
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+# Device diagnostics, logs, recordings and parameter backups
+*.log
+*.log.*
+elitech-debug.log*
+server-*.log
+device-check.json
+.device-backups/
+data/
+exports/
+backups/
+*.csv
+*.tsv
+*.xlsx
+*.pdf
+
+# Local configuration (publish only the documented example)
+config.json
+config.*.json
+!config.example.json
+*.local.json
+# SQLite databases, including journals and sidecar files
+*.sqlite3
+*.sqlite3-*
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*

@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 
 import json
+import hashlib
+import hmac
 import logging
+import math
 import os
-import select
+import argparse
+import sys
 import secrets
+import socket
 import shlex
 import shutil
 import subprocess
@@ -13,20 +18,37 @@ import threading
 import time
 import webbrowser
 
+from elitech_history import HistoryStore
+from elitech_settings import load_settings, open_history, configured_path
+from elitech_sync import SensorSync
+from elitech_hid import open_device, windows_devices, load_hidapi
+from elitech_rc4 import RC4ProSession, RC4ProDecoder, parse_compact_report, convert_alarm_units, decode_parameter_temperature, encode_parameter_temperature
+
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from urllib.request import urlopen
 
 
-APP_VERSION = "v21-tab-session-recovery"
+APP_VERSION = "v27-time-range"
 
 HOST = "127.0.0.1"
 PORT = 8765
 
 ELITECH_VENDOR_ID = "246C"
 ELITECH_PRODUCT_ID = "9001"
+
+HISTORY = None
+SYNC_MANAGER = None
+
+
+def get_history():
+    global HISTORY
+    if HISTORY is None:
+        HISTORY = open_history(load_settings())
+    return HISTORY
 
 HID_LOCK = threading.Lock()
 APP_TOKEN = secrets.token_urlsafe(32)
@@ -41,20 +63,10 @@ if not LOGGER.handlers:
         "%(asctime)s | %(levelname)s | %(message)s"
     )
 
-    file_handler = RotatingFileHandler(
-        DEBUG_LOG_PATH,
-        maxBytes=2_000_000,
-        backupCount=3,
-        encoding="utf-8",
-    )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
 
-    LOGGER.addHandler(file_handler)
     LOGGER.addHandler(console_handler)
 
 
@@ -101,6 +113,9 @@ def parse_hid_id(hid_id: str):
 
 
 def scan_devices():
+    if sys.platform == "win32":
+        return windows_devices(ELITECH_VENDOR_ID, ELITECH_PRODUCT_ID)
+
     devices = []
     root = Path("/sys/class/hidraw")
 
@@ -149,10 +164,10 @@ def find_device(device_path: str):
 
 def build_get_parameter_frame(offset: int, length: int) -> bytes:
     if not 0 <= offset <= 0xFFFFFF:
-        raise ValueError("Érvénytelen paramétercím.")
+        raise ValueError("Invalid parameter address.")
 
     if not 1 <= length <= 52:
-        raise ValueError("Érvénytelen lekérdezési hossz.")
+        raise ValueError("Invalid request length.")
 
     frame = [
         0x33,
@@ -174,35 +189,35 @@ def build_get_parameter_frame(offset: int, length: int) -> bytes:
     return packet + bytes(64 - len(packet))
 
 
-def drain_hid(fd: int):
+def drain_hid(fd):
     while True:
         try:
-            data = os.read(fd, 64)
+            data = fd.read(64)
             if not data:
                 return
         except BlockingIOError:
             return
 
 
-def parse_response(response: bytes):
+def parse_response(response: bytes, operation=0x03):
     if len(response) < 12:
-        raise ValueError("Túl rövid HID válasz.")
+        raise ValueError("HID response is too short.")
 
     if response[0:3] != bytes([0x33, 0xCC, 0x00]):
-        raise ValueError("Érvénytelen Elitech válaszfejléc.")
+        raise ValueError("Invalid Elitech response header.")
 
-    if response[4] != 0x03:
+    if response[4] != operation:
         raise ValueError(
-            f"Váratlan Elitech műveleti kód: 0x{response[4]:02X}"
+            f"Unexpected Elitech operation code: 0x{response[4]:02X}"
         )
 
     frame_length = response[3]
 
     if frame_length < 12:
-        raise ValueError("Érvénytelen válaszméret.")
+        raise ValueError("Invalid response size.")
 
     if frame_length > len(response):
-        raise ValueError("A HID válasz nem érkezett meg teljesen.")
+        raise ValueError("Incomplete HID response.")
 
     frame = response[:frame_length]
 
@@ -211,7 +226,7 @@ def parse_response(response: bytes):
 
     if actual_checksum != expected_checksum:
         raise ValueError(
-            f"Hibás válasz-checksum: "
+            f"Invalid response checksum: "
             f"0x{actual_checksum:02X} != 0x{expected_checksum:02X}"
         )
 
@@ -219,21 +234,23 @@ def parse_response(response: bytes):
     data_length = frame[10]
 
     if 11 + data_length > frame_length - 1:
-        raise ValueError("Csonka Elitech adatmező.")
+        raise ValueError("Truncated Elitech payload.")
 
     data = frame[11 : 11 + data_length]
     return offset, data
 
 
 def hid_get_parameter(
-    fd: int,
+    fd,
     offset: int,
     length: int,
     timeout: float = 1.0,
+    operation: int = 0x03,
 ) -> bytes:
     drain_hid(fd)
 
-    packet = build_get_parameter_frame(offset, length)
+    packet = (build_get_parameter_frame(offset, length) if operation == 0x03
+              else build_official_read_frame(operation, offset, length))
 
     LOGGER.debug(
         "HID GET TX | offset=0x%06X | len=%d | frame=%s",
@@ -242,12 +259,12 @@ def hid_get_parameter(
         frame_hex(packet, 12),
     )
 
-    written = os.write(fd, packet)
+    written = fd.write(packet)
 
     if written != len(packet):
-        raise OSError("Nem sikerült elküldeni a teljes HID csomagot.")
+        raise OSError("Could not send the complete HID report.")
 
-    readable, _, _ = select.select([fd], [], [], timeout)
+    readable = fd.wait_readable(timeout)
 
     if not readable:
         LOGGER.error(
@@ -256,10 +273,10 @@ def hid_get_parameter(
             length,
         )
         raise TimeoutError(
-            f"Az RC-5 nem válaszolt a 0x{offset:02X} lekérdezésre."
+            f"The logger did not answer the request at 0x{offset:02X}."
         )
 
-    response = os.read(fd, 64)
+    response = fd.read(64)
 
     response_len = (
         response[3]
@@ -273,7 +290,7 @@ def hid_get_parameter(
         frame_hex(response, response_len),
     )
 
-    response_offset, data = parse_response(response)
+    response_offset, data = parse_response(response, operation)
 
     requested_start = offset
     requested_end = offset + length
@@ -282,7 +299,7 @@ def hid_get_parameter(
 
     if requested_start < response_start or requested_end > response_end:
         raise ValueError(
-            "Az RC-5 nem a kért paramétertartományt küldte vissza."
+            "The logger returned a different parameter range."
         )
 
     start = requested_start - response_start
@@ -301,7 +318,7 @@ def hid_get_parameter(
 
 
 def prime_parameter_session(
-    fd: int,
+    fd,
     context: str,
     timeout: float = 1.0,
 ):
@@ -313,7 +330,7 @@ def prime_parameter_session(
     után megfigyeltük, hogy a rövid GetParameter olvasások egy része
     átmenetileg kizárólag 0xFF sentinel adatot ad vissza.
 
-    Az "Eszköz információk" tab ezt következetesen helyreállítja,
+    Az "Device information" tab ezt következetesen helyreállítja,
     mert az első két lekérdezése:
         0x000000 / 14 byte  -- identity
         0x000094 / 2 byte   -- protocol
@@ -434,7 +451,7 @@ def decode_capacity_record_count(
         00 00 7d 00 00 00 00 1b 00 00
         -> capacity 32000, records 27
 
-    Leállítás után ugyanez megfigyelten:
+    Stopped után ugyanez megfigyelten:
         ff ff 7d 00 00 00 00 1b ff ff
 
     A felső FF FF ebben az állapotban sentinel/állapotkitöltés,
@@ -447,7 +464,7 @@ def decode_capacity_record_count(
     """
     if len(capacity_data) != 10:
         raise ValueError(
-            f"Érvénytelen 0x42 blokkhossz: {len(capacity_data)}."
+            f"Invalid capacity block length: {len(capacity_data)}."
         )
 
     capacity_bytes = capacity_data[0:4]
@@ -507,9 +524,9 @@ def decode_capacity_record_count(
 
 def decode_interval_seconds(data: bytes) -> int | None:
     """
-    2-byte mintavételi intervallum; 10 másodperces egység.
+    2-byte mintavételi intervallum; 10 secondses egység.
 
-    FF FF runtime sentinelként nem valódi 10922,5 perc.
+    FF FF runtime sentinelként nem valódi 10922,5 minutes.
     """
     if len(data) != 2:
         return None
@@ -544,8 +561,8 @@ def decode_start_mode(byte: int) -> str:
     value = byte & 0b111
     modes = {
         0b000: "Azonnali",
-        0b001: "Kézi",
-        0b010: "Időzített",
+        0b001: "Manual",
+        0b010: "Scheduled",
         0b111: "Ismeretlen / MAX",
     }
     return modes.get(value, f"Ismeretlen (0b{value:03b})")
@@ -554,35 +571,38 @@ def decode_start_mode(byte: int) -> str:
 def decode_stop_mode(byte: int) -> str:
     value = byte & 0b111
     modes = {
-        0b000: "Kézi",
-        0b011: "Ideiglenes leállítás",
-        0b111: "Nincs érvényes leállítás / MAX",
+        0b000: "Manual",
+        0b011: "Temporarily stopped",
+        0b111: "No valid stop / MAX",
     }
     return modes.get(value, f"Ismeretlen (0b{value:03b})")
 
 
 def format_interval(seconds: int) -> str:
     if seconds % 3600 == 0:
-        return f"{seconds // 3600} óra"
+        return f"{seconds // 3600} hours"
 
     if seconds % 60 == 0:
-        return f"{seconds // 60} perc"
+        return f"{seconds // 60} minutes"
 
-    return f"{seconds} másodperc"
+    return f"{seconds} seconds"
 
 
 # ============================================================
-# Eszköz információk
+# Device information
 # ============================================================
 
 def read_device_info(device_path: str):
     with HID_LOCK:
-        fd = os.open(device_path, os.O_RDWR | os.O_NONBLOCK)
+        fd = open_device(device_path)
 
         try:
             identity = hid_get_parameter(fd, 0x00, 14)
+            model = int.from_bytes(identity[:2], "big")
+            trip_data = hid_get_parameter(fd, 0x00, 32, operation=0x05) if model == 0x0044 else None
             protocol_data = hid_get_parameter(fd, 0x94, 2)
             start_mode_data = hid_get_parameter(fd, 0x20, 1)
+            unit_probe_data = hid_get_parameter(fd, 0x21, 1)
             device_state_data = hid_get_parameter(fd, 0x25, 1)
             stop_battery_data = hid_get_parameter(fd, 0x26, 2)
             configuration_time_data = hid_get_parameter(fd, 0x28, 7)
@@ -591,7 +611,7 @@ def read_device_info(device_path: str):
             interval_data = hid_get_parameter(fd, 0x4C, 2)
             device_time_data = hid_get_parameter(fd, 0x88, 7)
         finally:
-            os.close(fd)
+            fd.close()
 
     model = int.from_bytes(identity[0:2], byteorder="big")
 
@@ -626,33 +646,35 @@ def read_device_info(device_path: str):
     )
 
     configuration_time = decode_datetime(configuration_time_data)
-    start_time = decode_datetime(start_stop_data[0:7])
-    stop_time = decode_datetime(start_stop_data[8:15])
+    start_time = decode_datetime(trip_data[8:15]) if trip_data is not None else decode_datetime(start_stop_data[0:7])
+    stop_time = "-" if trip_data is not None else decode_datetime(start_stop_data[8:15])
     device_time = decode_datetime(device_time_data)
 
     fields = [
-        {"label": "Sorozatszám", "value": serial_number or "Nincs adat"},
-        {"label": "Modellkód", "value": f"0x{model:04X}"},
-        {"label": "Protokollverzió", "value": f"0x{protocol_version:02X}"},
+        {"label": "Serial number", "value": serial_number or "No data"},
+        {"label": "Model", "value": "RC-4 Pro" if model == 0x0044 else f"0x{model:04X}"},
+        {"label": "Temperature probe", "value": "External" if unit_probe_data[0] & 0x02 else "Internal"},
+        {"label": "Logger temperature unit", "value": "°F" if unit_probe_data[0] & 0x08 else "°C"},
+        {"label": "Protocol version", "value": f"0x{protocol_version:02X}"},
         {
-            "label": "Logger kapacitása",
+            "label": "Logger capacity",
             "value": format_optional_count(
                 capacity,
-                " mérés",
+                " measurements",
             ),
         },
         {
-            "label": "Tárolt mérések száma",
+            "label": "Stored measurements",
             "value": format_optional_count(
                 record_count,
             ),
         },
-        {"label": "Mérés kezdési ideje", "value": start_time},
-        {"label": "Mérés leállítási ideje", "value": stop_time},
-        {"label": "Konfigurálás időpontja", "value": configuration_time},
-        {"label": "Készülék ideje", "value": device_time},
+        {"label": "Recording started", "value": start_time},
+        {"label": "Recording stopped", "value": stop_time},
+        {"label": "Configuration saved", "value": configuration_time},
+        {"label": "Logger time", "value": device_time},
         {
-            "label": "Mintavételi időköz",
+            "label": "Logging interval",
             "value": (
                 "-"
                 if interval_seconds is None
@@ -662,33 +684,33 @@ def read_device_info(device_path: str):
                 )
             ),
         },
-        {"label": "Indítási mód", "value": decode_start_mode(start_mode_byte)},
+        {"label": "Start mode", "value": decode_start_mode(start_mode_byte)},
         {
-            "label": "Gombos leállítás",
-            "value": "Engedélyezve"
+            "label": "Button stop",
+            "value": "Enabled"
             if start_mode_byte & (1 << 3)
-            else "Letiltva",
+            else "Disabled",
         },
         {
-            "label": "Szoftveres leállítás",
-            "value": "Engedélyezve"
+            "label": "Software stop",
+            "value": "Enabled"
             if start_mode_byte & (1 << 4)
-            else "Letiltva",
+            else "Disabled",
         },
         {
-            "label": "Eszközállapot",
-            "value": f"0x{device_state:02X} (nyers érték)",
+            "label": "Device state",
+            "value": f"0x{device_state:02X} (raw value)",
         },
         {
-            "label": "Tényleges leállítási mód",
+            "label": "Actual stop mode",
             "value": decode_stop_mode(actual_stop_byte),
         },
         {
-            "label": "Elemállapot",
+            "label": "Battery level",
             "value": (
                 "-"
                 if battery_raw is None
-                else f"{battery_raw} / 15 (nyers érték)"
+                else f"{battery_raw} / 15 (raw value)"
             ),
         },
     ]
@@ -712,13 +734,13 @@ def build_set_parameter_frame(offset: int, data: bytes) -> bytes:
     Elitech SetParameter (0x0004) HID frame.
     """
     if not 0 <= offset <= 0xFFFFFF:
-        raise ValueError("Érvénytelen paramétercím.")
+        raise ValueError("Invalid parameter address.")
 
     if not isinstance(data, (bytes, bytearray)):
-        raise TypeError("A konfigurációs adatnak bytes típusúnak kell lennie.")
+        raise TypeError("Configuration data must be bytes.")
 
     if not 1 <= len(data) <= 52:
-        raise ValueError("Érvénytelen konfigurációs adathossz.")
+        raise ValueError("Invalid configuration data length.")
 
     frame = [
         0x33,
@@ -741,7 +763,7 @@ def build_set_parameter_frame(offset: int, data: bytes) -> bytes:
     packet = bytes(frame)
 
     if len(packet) > 64:
-        raise ValueError("A HID csomag túl nagy.")
+        raise ValueError("HID report is too large.")
 
     return packet + bytes(64 - len(packet))
 
@@ -753,20 +775,20 @@ def parse_set_response(response: bytes, requested_offset: int):
     tartalmaz; 1 = siker.
     """
     if len(response) < 13:
-        raise ValueError("Túl rövid SetParameter válasz.")
+        raise ValueError("SetParameter response is too short.")
 
     if response[0:3] != bytes([0x33, 0xCC, 0x00]):
-        raise ValueError("Érvénytelen Elitech válaszfejléc.")
+        raise ValueError("Invalid Elitech response header.")
 
     if response[4] != 0x04:
         raise ValueError(
-            f"Váratlan Elitech műveleti kód: 0x{response[4]:02X}"
+            f"Unexpected Elitech operation code: 0x{response[4]:02X}"
         )
 
     frame_length = response[3]
 
     if frame_length < 13 or frame_length > len(response):
-        raise ValueError("Érvénytelen SetParameter válaszméret.")
+        raise ValueError("Invalid SetParameter response size.")
 
     frame = response[:frame_length]
 
@@ -775,7 +797,7 @@ def parse_set_response(response: bytes, requested_offset: int):
 
     if actual_checksum != expected_checksum:
         raise ValueError(
-            f"Hibás SetParameter checksum: "
+            f"Invalid SetParameter checksum: "
             f"0x{actual_checksum:02X} != 0x{expected_checksum:02X}"
         )
 
@@ -787,19 +809,19 @@ def parse_set_response(response: bytes, requested_offset: int):
 
     if response_offset != requested_offset:
         raise ValueError(
-            f"A válasz címe eltér a kért címtől: "
+            f"Response address differs from request: "
             f"0x{response_offset:06X} != 0x{requested_offset:06X}"
         )
 
     if frame[10] != 1:
         raise ValueError(
-            f"Váratlan SetParameter státuszhossz: {frame[10]}"
+            f"Unexpected SetParameter status length: {frame[10]}"
         )
 
     if frame[11] != 1:
         raise RuntimeError(
-            f"Az RC-5 elutasította a konfiguráció írását "
-            f"(státusz: 0x{frame[11]:02X})."
+            f"The logger rejected the settings "
+            f"(status: 0x{frame[11]:02X})."
         )
 
 
@@ -828,10 +850,10 @@ def build_official_set_packet(
     We reproduce that byte-for-byte instead of "fixing" it.
     """
     if not 0 <= offset <= 0xFFFFFF:
-        raise ValueError("Érvénytelen paramétercím.")
+        raise ValueError("Invalid parameter address.")
 
     if not isinstance(data, (bytes, bytearray)):
-        raise TypeError("A konfigurációs adatnak bytes típusúnak kell lennie.")
+        raise TypeError("Configuration data must be bytes.")
 
     if declared_length is None:
         declared_length = len(data)
@@ -840,11 +862,11 @@ def build_official_set_packet(
         frame_length = 11 + len(data) + 1
 
     if not 0 <= declared_length <= 0xFF:
-        raise ValueError("Érvénytelen deklarált adathossz.")
+        raise ValueError("Invalid declared payload length.")
 
     if frame_length != 11 + len(data) + 1:
         raise ValueError(
-            "A frame_length nem egyezik a tényleges Elitech frame méretével."
+            "frame_length does not match the actual Elitech frame size."
         )
 
     frame = [
@@ -865,16 +887,16 @@ def build_official_set_packet(
     frame.append(sum(frame) & 0xFF)
 
     if len(frame) != frame_length:
-        raise RuntimeError("Belső hiba: hibás Elitech frame hossz.")
+        raise RuntimeError("Internal error: incorrect Elitech frame length.")
 
     if len(frame) > 64:
-        raise ValueError("A HID csomag túl nagy.")
+        raise ValueError("HID report is too large.")
 
     return bytes(frame) + bytes(64 - len(frame))
 
 
 def hid_set_parameter_official(
-    fd: int,
+    fd,
     offset: int,
     data: bytes,
     *,
@@ -910,19 +932,19 @@ def hid_set_parameter_official(
         frame_hex(packet, packet[3]),
     )
 
-    written = os.write(fd, packet)
+    written = fd.write(packet)
 
     if written != len(packet):
-        raise OSError("Nem sikerült elküldeni a teljes HID csomagot.")
+        raise OSError("Could not send the complete HID report.")
 
-    readable, _, _ = select.select([fd], [], [], timeout)
+    readable = fd.wait_readable(timeout)
 
     if not readable:
         raise TimeoutError(
-            f"Az RC-5 nem válaszolt a 0x{offset:02X} konfigurációírásra."
+            f"The logger did not acknowledge settings at 0x{offset:02X}."
         )
 
-    response = os.read(fd, 64)
+    response = fd.read(64)
 
     response_len = response[3] if len(response) >= 4 else len(response)
 
@@ -951,7 +973,7 @@ def encode_official_elitech_datetime(value: datetime) -> bytes:
     A korábbi saját kódunk itt 0-t írt, ami eltért a gyári programtól.
     """
     if value.year < 2000 or value.year > 2255:
-        raise ValueError("A dátum éve nem ábrázolható az RC-5 formátumában.")
+        raise ValueError("The year cannot be represented in the logger date format.")
 
     # Python weekday(): Monday=0 ... Sunday=6
     # .NET DayOfWeek: Sunday=0 ... Saturday=6
@@ -971,7 +993,7 @@ def encode_official_elitech_datetime(value: datetime) -> bytes:
 
 
 def hid_set_parameter(
-    fd: int,
+    fd,
     offset: int,
     data: bytes,
     timeout: float = 1.0,
@@ -993,12 +1015,12 @@ def hid_set_parameter(
         frame_hex(packet, packet[3]),
     )
 
-    written = os.write(fd, packet)
+    written = fd.write(packet)
 
     if written != len(packet):
-        raise OSError("Nem sikerült elküldeni a teljes HID csomagot.")
+        raise OSError("Could not send the complete HID report.")
 
-    readable, _, _ = select.select([fd], [], [], timeout)
+    readable = fd.wait_readable(timeout)
 
     if not readable:
         LOGGER.error(
@@ -1007,10 +1029,10 @@ def hid_set_parameter(
             len(data),
         )
         raise TimeoutError(
-            f"Az RC-5 nem válaszolt a 0x{offset:02X} konfigurációírásra."
+            f"The logger did not acknowledge settings at 0x{offset:02X}."
         )
 
-    response = os.read(fd, 64)
+    response = fd.read(64)
 
     response_len = (
         response[3]
@@ -1048,16 +1070,16 @@ def build_generic_command_frame(
     The operation is encoded little-endian in bytes 4..5.
     """
     if not 0 <= operation <= 0xFFFF:
-        raise ValueError("Érvénytelen Elitech műveleti kód.")
+        raise ValueError("Invalid Elitech operation code.")
 
     if not 0 <= offset <= 0xFFFFFF:
-        raise ValueError("Érvénytelen Elitech cím.")
+        raise ValueError("Invalid Elitech address.")
 
     if not isinstance(data, (bytes, bytearray)):
-        raise TypeError("A parancs adata bytes típusú legyen.")
+        raise TypeError("Command data must be bytes.")
 
     if len(data) > 52:
-        raise ValueError("Túl hosszú Elitech parancsadat.")
+        raise ValueError("Elitech command data is too long.")
 
     frame = [
         0x33,
@@ -1080,13 +1102,13 @@ def build_generic_command_frame(
     packet = bytes(frame)
 
     if len(packet) > 64:
-        raise ValueError("A HID csomag túl nagy.")
+        raise ValueError("HID report is too large.")
 
     return packet + bytes(64 - len(packet))
 
 
 def hid_generic_command(
-    fd: int,
+    fd,
     operation: int,
     *,
     offset: int = 0,
@@ -1111,19 +1133,14 @@ def hid_generic_command(
         frame_hex(packet, packet[3]),
     )
 
-    written = os.write(fd, packet)
+    written = fd.write(packet)
 
     if written != len(packet):
         raise OSError(
-            "Nem sikerült elküldeni a teljes Elitech parancsot."
+            "Could not send the complete Elitech command."
         )
 
-    readable, _, _ = select.select(
-        [fd],
-        [],
-        [],
-        timeout,
-    )
+    readable = fd.wait_readable(timeout)
 
     if not readable:
         LOGGER.warning(
@@ -1132,7 +1149,7 @@ def hid_generic_command(
         )
         return b""
 
-    response = os.read(fd, 64)
+    response = fd.read(64)
 
     response_len = (
         response[3]
@@ -1149,26 +1166,23 @@ def hid_generic_command(
     return response
 
 
-def hid_format_command(fd: int) -> bytes:
-    """
-    KÍSÉRLETI finalizálási teszt.
+def hid_format_command(fd) -> bytes:
+    """Prepare a new session after the caller has checked data-loss consent."""
+    response = hid_generic_command(fd, 0x02C0, offset=0, data=b"\x00", timeout=2.0)
+    if not response:
+        raise TimeoutError("The logger did not acknowledge preparation of the new session.")
+    if (len(response) < 13 or response[:3] != b"\x33\xcc\x00"
+            or response[3] != 13 or response[4:6] != b"\xc0\x02"
+            or response[10] != 1 or response[11] != 1
+            or response[12] != sum(response[:12]) & 0xFF):
+        raise ValueError("The logger rejected preparation of the new recording session.")
+    return response
 
-    0x02C0 a python-elitech forrásban FormatCommand néven szerepel.
-    Ez törölheti a mérési memóriát, ezért csak akkor hívható, ha
-    a record_count előzetesen pontosan 0.
-    """
-    return hid_generic_command(
-        fd,
-        0x02C0,
-        offset=0,
-        data=b"\x00",
-        timeout=2.0,
-    )
 
 
 def encode_device_datetime(value: datetime) -> bytes:
     if value.year < 2000 or value.year > 2255:
-        raise ValueError("A dátum éve nem ábrázolható az RC-5 formátumában.")
+        raise ValueError("The year cannot be represented in the logger date format.")
 
     return bytes(
         [
@@ -1246,17 +1260,17 @@ def read_record_count_from_fd(fd: int):
         time.sleep(0.06)
 
     raise RuntimeError(
-        "A logger kapacitás/rekordszám mezője jelenleg "
-        "nem értelmezhető biztonságosan "
-        f"(utolsó nyers 0x42 blokk: "
+        "The logger capacity/record count currently "
+        "cannot be read reliably "
+        f"(last raw capacity block: "
         f"{last_raw.hex(' ') if last_raw else '-'}). "
-        "A konfiguráció mentését ezért nem engedjük."
+        "Saving settings is unavailable until the count can be read."
     )
 
 
 
 # ============================================================
-# Mérési rekordok kiolvasása
+# Measurementi rekordok kiolvasása
 # ============================================================
 
 RECORD_LENGTH = 8
@@ -1314,13 +1328,13 @@ def build_official_read_frame(
     operation jelenleg 0x03 vagy 0x05.
     """
     if operation not in (0x03, 0x05):
-        raise ValueError("Nem támogatott read operation.")
+        raise ValueError("Unsupported read operation.")
 
     if not 0 <= offset <= 0xFFFFFF:
-        raise ValueError("Érvénytelen read offset.")
+        raise ValueError("Invalid read offset.")
 
     if not 1 <= length <= 0xFF:
-        raise ValueError("Érvénytelen read length.")
+        raise ValueError("Invalid read length.")
 
     frame = [
         0x33,
@@ -1342,7 +1356,7 @@ def build_official_read_frame(
 
 
 def run_official_parameter_preamble(
-    fd: int,
+    fd,
     timeout: float = 1.0,
 ) -> None:
     """
@@ -1364,18 +1378,13 @@ def run_official_parameter_preamble(
     drained = 0
 
     while True:
-        readable, _, _ = select.select(
-            [fd],
-            [],
-            [],
-            0,
-        )
+        readable = fd.wait_readable(0)
 
         if not readable:
             break
 
         try:
-            old = os.read(fd, 64)
+            old = fd.read(64)
         except BlockingIOError:
             break
 
@@ -1419,28 +1428,23 @@ def run_official_parameter_preamble(
             frame_hex(packet, packet[3]),
         )
 
-        written = os.write(fd, packet)
+        written = fd.write(packet)
 
         if written != len(packet):
             raise OSError(
-                "Nem sikerült elküldeni a gyári read preamble packetet."
+                "Could not send the connection initialization request."
             )
 
-        readable, _, _ = select.select(
-            [fd],
-            [],
-            [],
-            timeout,
-        )
+        readable = fd.wait_readable(timeout)
 
         if not readable:
             raise TimeoutError(
-                "Az RC-5 nem válaszolt a gyári paraméter-read "
-                f"preamble {index}. packetére "
+                "The logger did not answer connection initialization "
+                f"request {index} "
                 f"(op=0x{operation:02X}, offset=0x{offset:06X})."
             )
 
-        response = os.read(fd, 64)
+        response = fd.read(64)
 
         LOGGER.debug(
             "FACTORY READ RX | n=%d/%d | op=0x%02X | "
@@ -1472,10 +1476,10 @@ def build_get_record_frame(
       - byte[5] = 0 a normál rekordtárhoz
     """
     if not 0 <= offset <= 0xFFFFFF:
-        raise ValueError("Érvénytelen rekordoffset.")
+        raise ValueError("Invalid record offset.")
 
     if not 1 <= count <= 0xFF:
-        raise ValueError("Érvénytelen rekorddarabszám.")
+        raise ValueError("Invalid record count.")
 
     frame = [
         0x33,
@@ -1504,7 +1508,7 @@ def is_record_ack_only(
 
       33 cc 00 0c 01 00 00 00 00 00 00 0c 00 00 ...
 
-    Ez nem mérési adat. A v15 tévesen rekordpacketként próbálta parse-olni.
+    Ez nem measurementsi adat. A v15 tévesen rekordpacketként próbálta parse-olni.
     """
     if len(report) < 12:
         return False
@@ -1537,7 +1541,7 @@ def validate_record_report_header(
 
     if report[0:3] != bytes([0x33, 0xCC, 0x00]):
         raise ValueError(
-            "Érvénytelen GetRecord report header."
+            "Invalid GetRecord report header."
         )
 
     if report[4] != 0x01:
@@ -1554,11 +1558,11 @@ def parse_elitech_record(
     Elitech 8-byte standard rekord dekódolás.
 
     Az új 246c:9001 / protocol 0x35 RC-5 hardveren a szabályos
-    mérési rekordok byte0 értéke következetesen 0xC0.
+    measurementsi rekordok byte0 értéke következetesen 0xC0.
 
     A régi flag-térkép ezt 0x80=Error + 0x40=Sign2 kombinációnak
     értelmezte, ezért a v16 minden normál rekordot tévesen
-    "Hiba" állapotúnak mutatott.
+    "Error" állapotúnak mutatott.
 
     Protocol >= 0x35 esetén ezért a felső két bitet az új
     rekordformátum markerének kezeljük; az alsó 6 bit esemény/sign
@@ -1569,7 +1573,7 @@ def parse_elitech_record(
     """
     if len(raw) != RECORD_LENGTH:
         raise ValueError(
-            f"Érvénytelen rekordhossz: {len(raw)}."
+            f"Invalid record length: {len(raw)}."
         )
 
     if raw == bytes([0xFF]) * RECORD_LENGTH:
@@ -1625,29 +1629,29 @@ def parse_elitech_record(
     flag_labels = []
 
     if flags & RECORD_FLAG_MARK:
-        flag_labels.append("Jelölés")
+        flag_labels.append("Marked")
 
     if flags & RECORD_FLAG_LIGHT:
-        flag_labels.append("Fény")
+        flag_labels.append("Light")
 
     if flags & RECORD_FLAG_VIBRATION:
-        flag_labels.append("Rezgés")
+        flag_labels.append("Vibration")
 
     if flags & RECORD_FLAG_PAUSE:
-        status = "Szünet"
+        status = "Paused"
     elif flags & RECORD_FLAG_STOP:
-        status = "Leállítás"
+        status = "Stopped"
     elif (
         protocol_version < 0x35
         and flags & RECORD_FLAG_ERROR
     ):
-        status = "Hiba"
+        status = "Error"
     else:
-        status = "Mérés"
+        status = "Measurement"
 
     temperature_value = (
         temperature
-        if status == "Mérés"
+        if status == "Measurement"
         else None
     )
 
@@ -1705,20 +1709,15 @@ def count_plausible_records(
 
 
 def read_one_hid_report(
-    fd: int,
+    fd,
     timeout: float,
 ) -> bytes | None:
-    readable, _, _ = select.select(
-        [fd],
-        [],
-        [],
-        timeout,
-    )
+    readable = fd.wait_readable(timeout)
 
     if not readable:
         return None
 
-    response = os.read(fd, 64)
+    response = fd.read(64)
 
     if not response:
         return None
@@ -1727,7 +1726,7 @@ def read_one_hid_report(
 
 
 def get_record_data_report(
-    fd: int,
+    fd,
     offset: int,
     protocol_version: int,
     timeout: float = 1.5,
@@ -1756,11 +1755,11 @@ def get_record_data_report(
         frame_hex(packet, packet[3]),
     )
 
-    written = os.write(fd, packet)
+    written = fd.write(packet)
 
     if written != len(packet):
         raise OSError(
-            "Nem sikerült elküldeni a teljes GetRecord HID csomagot."
+            "Could not send the complete record request."
         )
 
     deadline = time.monotonic() + timeout
@@ -1843,14 +1842,72 @@ def get_record_data_report(
 
     if saw_ack:
         raise TimeoutError(
-            "A GetRecord ACK megérkezett, de utána nem érkezett "
-            "mérési adatreport. A v16 logban a teljes gyári read "
-            "preamble és az ACK utáni report-stream is látszik."
+            "The record request was acknowledged but no "
+            "measurement data followed. The debug log includes the connection "
+            "initialization and subsequent reports."
         )
 
     raise TimeoutError(
-        "Az RC-5 nem válaszolt a mérési rekord lekérésére."
+        "The logger did not answer the measurement request."
     )
+
+
+def read_rc4_pro_records(fd, identity, record_count, capacity, limit):
+    unit_probe = hid_get_parameter(fd, 0x21, 1)[0]
+    interval = decode_interval_seconds(hid_get_parameter(fd, 0x4C, 2))
+    trip = hid_get_parameter(fd, 0, 32, operation=0x05)
+    start_text = decode_datetime(trip[8:15])
+    if start_text == "-":
+        raise ValueError("The RC-4 Pro did not provide a valid recording start time.")
+    session = RC4ProSession(
+        serial=identity[2:14].decode("ascii").strip("\x00 "),
+        started_at=datetime.strptime(start_text, "%Y-%m-%d %H:%M:%S"),
+        interval_seconds=interval,
+        temperature_unit="F" if unit_probe & 0x08 else "C",
+        probe="external" if unit_probe & 0x02 else "internal",
+        record_count=record_count,
+        capacity=capacity,
+    )
+    decoder = RC4ProDecoder(session)
+    first_wanted = max(0, record_count - limit) if limit else 0
+    records = []
+    # Read preceding packets as well: pause records change the timestamp of
+    # later measurements, so index * interval alone is not sufficient.
+    for offset in range(0, record_count, 12):
+        packet = build_get_record_frame(offset, 12)
+        if fd.write(packet) != len(packet):
+            raise OSError("Could not send the complete RC-4 Pro record request.")
+        deadline = time.monotonic() + 2.0
+        raw_records = None
+        while time.monotonic() < deadline:
+            if not fd.wait_readable(max(0, deadline - time.monotonic())):
+                break
+            response = fd.read(64)
+            LOGGER.debug("RC4 COMPACT RX | offset=%d | raw=%s", offset, response.hex(" "))
+            raw_records = parse_compact_report(response, offset, 12)
+            if raw_records is not None:
+                break
+        if raw_records is None:
+            raise TimeoutError("The RC-4 Pro did not return its compact measurement records.")
+        for index, raw in enumerate(raw_records[:min(12, record_count - offset)]):
+            record = decoder.decode(raw)
+            if offset + index >= first_wanted:
+                records.append(record.as_dict())
+    return {
+        "protocol_version": 0x54,
+        "capacity": capacity,
+        "stored_count": record_count,
+        "loaded_count": len(records),
+        "start_index": records[0]["index"] if records else None,
+        "end_index": records[-1]["index"] if records else None,
+        "records": records,
+        "source": "hid",
+        "record_format": "rc4-pro-compact-4-byte",
+        "probe": session.probe,
+        "started_at": session.started_at.strftime("%Y-%m-%d %H:%M:%S"),
+        "logger_temperature_unit": session.temperature_unit,
+        "interval_seconds": session.interval_seconds,
+    }
 
 
 def read_device_records(
@@ -1858,7 +1915,7 @@ def read_device_records(
     limit: int = 500,
 ):
     """
-    Mérési rekordok read-only kiolvasása.
+    Measurementi rekordok read-only kiolvasása.
 
     A v16 két, az ElitechLog V8.0.5.0-ból visszafejtett részt
     reprodukál:
@@ -1872,12 +1929,12 @@ def read_device_records(
         limit = int(limit)
     except (TypeError, ValueError):
         raise ValueError(
-            "A rekordlimit egész szám legyen."
+            "Record limit must be an integer."
         )
 
-    if limit < 0 or limit > 32000:
+    if limit < 0 or limit > 64000:
         raise ValueError(
-            "A rekordlimit 0 és 32000 között lehet."
+            "Record limit must be between 0 and 64000; 0 means all."
         )
 
     LOGGER.info(
@@ -1888,13 +1945,10 @@ def read_device_records(
     )
 
     with HID_LOCK:
-        fd = os.open(
-            device_path,
-            os.O_RDWR | os.O_NONBLOCK,
-        )
+        fd = open_device(device_path)
 
         try:
-            prime_parameter_session(
+            identity, _ = prime_parameter_session(
                 fd,
                 context="record-read-precheck",
             )
@@ -1905,7 +1959,7 @@ def read_device_records(
 
             if record_count > capacity:
                 raise RuntimeError(
-                    "A logger rekordszáma nagyobb a kapacitásnál."
+                    "The reported record count exceeds the logger capacity."
                 )
 
             if record_count == 0:
@@ -1918,6 +1972,10 @@ def read_device_records(
                     "end_index": None,
                     "records": [],
                 }
+
+            if int.from_bytes(identity[:2], "big") == 0x0044 and protocol_version == 0x54:
+                data = read_rc4_pro_records(fd, identity, record_count, capacity, limit)
+                return save_recording_history(fd, identity, data)
 
             if limit == 0:
                 wanted_start = 0
@@ -1995,7 +2053,7 @@ def read_device_records(
                                 "timestamp": None,
                                 "temperature": None,
                                 "humidity": None,
-                                "status": "Nincs adat",
+                                "status": "No data",
                                 "flags": [],
                                 "flags_raw": 0,
                                 "raw_hex": raw.hex(" "),
@@ -2021,7 +2079,7 @@ def read_device_records(
                             "timestamp": None,
                             "temperature": None,
                             "humidity": None,
-                            "status": "Értelmezési hiba",
+                            "status": "Parse error",
                             "flags": [],
                             "flags_raw": None,
                             "raw_hex": raw.hex(" "),
@@ -2060,13 +2118,13 @@ def read_device_records(
                     cleanup_error,
                 )
             finally:
-                os.close(fd)
+                fd.close()
 
     valid_measurements = sum(
         1
         for record in parsed_records
         if (
-            record.get("status") == "Mérés"
+            record.get("status") == "Measurement"
             and record.get("temperature") is not None
         )
     )
@@ -2109,6 +2167,44 @@ def read_device_records(
     }
 
 
+def save_recording_history(fd, identity, data):
+    configuration_time = hid_get_parameter(fd, 0x28, 7)
+    data["session_id"] = recording_session_id(fd, identity, configuration_time)
+    data["serial_number"] = identity[2:14].decode("ascii").strip("\x00 ")
+    data["configuration_time"] = decode_datetime(configuration_time)
+    data["saved_count"] = get_history().save(data)
+    return data
+
+
+def recording_session_id(fd, identity, configuration_time):
+    """Identify the recording without including its growing record count."""
+    model = int.from_bytes(identity[:2], "big")
+    if model == 0x0044:
+        trip = hid_get_parameter(fd, 0, 32, operation=0x05)
+        marker = trip[:15]  # trip ID and recording start, not live readings
+    else:
+        marker = hid_get_parameter(fd, 0x30, 7)
+    return hashlib.sha256(identity + configuration_time + marker).hexdigest()
+
+
+def validate_configuration_confirmation(record_count, expected_record_count,
+                                        session_id, expected_session_id, allow_data_loss):
+    """Consent covers this session, including samples arriving before Save."""
+    if expected_session_id is not None:
+        if not isinstance(expected_session_id, str) or not hmac.compare_digest(session_id, expected_session_id):
+            raise RuntimeError("The recording session changed. Reload the settings and confirm the new session.")
+    if expected_record_count is not None:
+        if isinstance(expected_record_count, bool) or not isinstance(expected_record_count, int) or expected_record_count < 0:
+            raise ValueError("Invalid expected record count.")
+        if record_count < expected_record_count:
+            raise RuntimeError("The logger's record count decreased; it may have been reset. Reload the settings and confirm again.")
+    if record_count and not allow_data_loss:
+        raise RuntimeError(f"The logger contains {record_count} measurements. Confirm erasing this recording session before saving.")
+    if record_count and allow_data_loss:
+        if expected_session_id is None or expected_record_count is None:
+            raise RuntimeError("Reload the page and confirm erasing the current recording session before saving.")
+
+
 def read_device_config(device_path: str):
     """
     A jelenleg támogatott konfigurációs mezők beolvasása.
@@ -2122,19 +2218,19 @@ def read_device_config(device_path: str):
     )
 
     with HID_LOCK:
-        fd = os.open(
-            device_path,
-            os.O_RDWR | os.O_NONBLOCK,
-        )
+        fd = open_device(device_path)
 
         try:
-            prime_parameter_session(
+            identity, _ = prime_parameter_session(
                 fd,
                 context="config-read",
             )
 
             start_mode_data = hid_get_parameter(fd, 0x20, 1)
+            unit_data = hid_get_parameter(fd, 0x21, 1)
+            alarm_data = hid_get_parameter(fd, 0x54, 4)
             configuration_time_data = hid_get_parameter(fd, 0x28, 7)
+            session_id = recording_session_id(fd, identity, configuration_time_data)
             interval_data = hid_get_parameter(fd, 0x4C, 2)
             device_time_data = hid_get_parameter(fd, 0x88, 7)
 
@@ -2174,13 +2270,13 @@ def read_device_config(device_path: str):
                     interval_seconds,
                 )
         finally:
-            os.close(fd)
+            fd.close()
 
     start_byte = start_mode_data[0]
     if interval_seconds is None:
         raise RuntimeError(
-            "A mintavételi időköz jelenleg nem olvasható ki "
-            "megbízhatóan. A mentést biztonsági okból nem engedjük."
+            "The logging interval cannot currently be read "
+            "reliably. Read the configuration again before saving."
         )
 
     LOGGER.info(
@@ -2198,27 +2294,34 @@ def read_device_config(device_path: str):
 
     return {
         "path": device_path,
+        "serial_number": identity[2:14].decode("ascii").strip("\x00 "),
+        "model": "RC-4 Pro" if int.from_bytes(identity[:2], "big") == 0x0044 else "Elitech logger",
         "protocol_version": protocol_version,
         "capacity": capacity,
         "record_count": record_count,
         "interval_seconds": interval_seconds,
         "interval_minutes": interval_seconds / 60.0,
+        "temperature_unit": "F" if unit_data[0] & 0x08 else "C",
+        "probe": "external" if unit_data[0] & 0x02 else "internal",
+        "alarm_high": decode_parameter_temperature(alarm_data[:2]),
+        "alarm_low": decode_parameter_temperature(alarm_data[2:]),
         "start_mode_raw": start_byte & 0b111,
         "start_mode": decode_start_mode(start_byte),
         "button_stop": bool(start_byte & (1 << 3)),
         "software_stop": bool(start_byte & (1 << 4)),
         "configuration_time": decode_datetime(configuration_time_data),
         "device_time": decode_datetime(device_time_data),
+        "session_id": session_id,
         "can_configure": True,
         "requires_data_loss_confirmation": record_count > 0,
         "blocked_reason": (
             ""
             if record_count == 0
             else (
-                f"A logger {record_count} tárolt mérési rekordot tartalmaz. "
-                "A konfiguráció mentése a gyári FormatCommand miatt ezeket "
-                "törli. A mentés csak kettős, szándékos megerősítés után "
-                "engedélyezett."
+                f"The logger contains {record_count} measurements. "
+                "Saving settings will "
+                "erase them. Two confirmations are "
+                "required before saving."
             )
         ),
     }
@@ -2255,6 +2358,11 @@ def _patch_compat_config_blocks(
     button_stop: bool,
     software_stop: bool,
     sync_clock: bool,
+    interval_seconds: int | None = None,
+    temperature_unit: str | None = None,
+    probe: str | None = None,
+    alarm_high: float | None = None,
+    alarm_low: float | None = None,
 ):
     """
     A gyári ElitechLog save-flow alapján készítjük elő a hat blokkot.
@@ -2273,7 +2381,8 @@ def _patch_compat_config_blocks(
         for start, data in blocks.items()
     }
 
-    interval_seconds = interval_minutes * 60
+    if interval_seconds is None:
+        interval_seconds = interval_minutes * 60
     interval_raw = interval_seconds // 10
 
     block0 = by_start[0x00]
@@ -2290,12 +2399,25 @@ def _patch_compat_config_blocks(
 
     block0[0x20] = new_start
 
+    if probe is not None:
+        block0[0x21] = (block0[0x21] & ~0x02) | (0x02 if probe == "external" else 0)
+
+    old_unit = "F" if block0[0x21] & 0x08 else "C"
+    if temperature_unit is not None:
+        # Temperature unit is bit 3 at parameter 0x21. Preserve sensor bits.
+        block0[0x21] = (block0[0x21] & ~0x08) | (0x08 if temperature_unit == "F" else 0)
+
     if sync_clock:
         now = datetime.now().replace(microsecond=0)
         encoded = encode_official_elitech_datetime(now)
         block0[0x28:0x2F] = encoded
 
     block1 = by_start[0x30]
+    if temperature_unit is not None:
+        convert_alarm_units(block1, old_unit, temperature_unit)
+    if alarm_high is not None:
+        block1[0x24:0x26] = encode_parameter_temperature(alarm_high)
+        block1[0x26:0x28] = encode_parameter_temperature(alarm_low)
     interval_pos = 0x4C - 0x30
     block1[
         interval_pos : interval_pos + 2
@@ -2317,15 +2439,97 @@ def _patch_compat_config_blocks(
     }
 
 
+def read_preparation_state(fd):
+    identity, _ = prime_parameter_session(fd, context="preparation-readback")
+    _, capacity, record_count = read_record_count_from_fd(fd)
+    return {
+        "identity": identity,
+        "capacity": capacity,
+        "record_count": record_count,
+        "state": hid_get_parameter(fd, 0x25, 1)[0] & 0x3F,
+        "start": hid_get_parameter(fd, 0x20, 1)[0],
+        "unit_probe": hid_get_parameter(fd, 0x21, 1)[0],
+        "alarm": hid_get_parameter(fd, 0x54, 4),
+        "interval": int.from_bytes(hid_get_parameter(fd, 0x4C, 2), "big"),
+        "configuration_time": hid_get_parameter(fd, 0x28, 7),
+        "device_time": hid_get_parameter(fd, 0x88, 7),
+    }
+
+
+def check_preparation_state(state, identity, blocks, sync_clock):
+    problems = []
+    if state["identity"] != identity:
+        problems.append("a different logger was found")
+    if state["record_count"] != 0:
+        problems.append(f"the previous recording has not cleared ({state['record_count']} records remain)")
+    if int.from_bytes(identity[:2], "big") == 0x0044 and state["state"] != 4:
+        problems.append("the logger is not ready for a new manual recording")
+    if state["start"] & 0x1F != blocks[0][0x20] & 0x1F:
+        problems.append("the start/stop settings do not match")
+    if state["unit_probe"] & 0x0A != blocks[0][0x21] & 0x0A:
+        problems.append("the temperature unit/probe does not match")
+    if state["interval"] != int.from_bytes(blocks[0x30][0x1C:0x1E], "big"):
+        problems.append("the logging interval does not match")
+    if state["alarm"] != blocks[0x30][0x24:0x28]:
+        problems.append("the alarm limits do not match")
+    if state["configuration_time"] != blocks[0][0x28:0x2F]:
+        problems.append("the configuration time does not match")
+    clock_text = decode_datetime(state["device_time"])
+    if clock_text == "-":
+        problems.append("the logger clock has not restarted")
+    elif sync_clock:
+        requested_text = decode_datetime(blocks[0][0x28:0x2F])
+        if requested_text == "-":
+            problems.append("the requested clock time is invalid")
+        else:
+            requested = datetime.strptime(requested_text, "%Y-%m-%d %H:%M:%S")
+            actual = datetime.strptime(clock_text, "%Y-%m-%d %H:%M:%S")
+            if not -2 <= (actual - requested).total_seconds() <= max(10, (datetime.now() - requested).total_seconds() + 10):
+                problems.append("the logger clock does not match the requested time")
+    if problems:
+        raise RuntimeError("; ".join(problems))
+
+
+def verify_preparation_readback(device_path, identity, blocks, sync_clock, timeout=8.0):
+    """Only retry reads. Never repeat parameter writes or FormatCommand."""
+    deadline = time.monotonic() + timeout
+    while True:
+        fd = None
+        try:
+            fd = open_device(device_path)
+            state = read_preparation_state(fd)
+            check_preparation_state(state, identity, blocks, sync_clock)
+            LOGGER.info("PREPARATION VERIFIED | records=%d | state=0x%02X | unit_probe=0x%02X | interval_raw=%d",
+                        state["record_count"], state["state"], state["unit_probe"], state["interval"])
+            return state
+        except (OSError, ValueError, RuntimeError) as error:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "The preparation command was sent, but its result could not be verified. "
+                    "Reload device information before trying again. Details: " + str(error)
+                ) from error
+            LOGGER.info("PREPARATION READBACK WAIT | %s", error)
+        finally:
+            if fd is not None:
+                fd.close()
+        time.sleep(0.2)
+
+
 def apply_device_config(
     device_path: str,
     *,
-    interval_minutes: int,
+    interval_minutes: int | None = None,
+    interval_seconds: int | None = None,
+    temperature_unit: str | None = None,
+    probe: str | None = None,
+    alarm_high: float | None = None,
+    alarm_low: float | None = None,
     sync_clock: bool,
     button_stop: bool,
     software_stop: bool,
     allow_data_loss: bool = False,
     expected_record_count: int | None = None,
+    expected_session_id: str | None = None,
 ):
     """
     ElitechLog Win V8.0.5.0 save-flow rekonstrukció.
@@ -2342,35 +2546,31 @@ def apply_device_config(
 
     Ezt a sorrendet reprodukáljuk.
     """
-    try:
-        interval_minutes = int(interval_minutes)
-    except (TypeError, ValueError):
-        raise ValueError(
-            "A mintavételi időköz csak egész perc lehet."
-        )
-
-    if interval_minutes < 1 or interval_minutes > 1440:
-        raise ValueError(
-            "A mintavételi időköz 1 és 1440 perc között lehet."
-        )
-
-    interval_seconds = interval_minutes * 60
-
-    if interval_seconds % 10 != 0:
-        raise ValueError(
-            "Az RC-5 mintavételi időközének 10 másodperces "
-            "egységre kell illeszkednie."
-        )
-
+    if interval_seconds is None:
+        try:
+            interval_seconds = float(interval_minutes) * 60
+        except (TypeError, ValueError):
+            raise ValueError("Choose a logging interval.")
+    if isinstance(interval_seconds, bool) or not isinstance(interval_seconds, (int, float)):
+        raise ValueError("The logging interval must be a number of seconds.")
+    if not 10 <= interval_seconds <= 86400 or interval_seconds % 10 != 0:
+        raise ValueError("Use an interval from 10 seconds to 24 hours, in steps of 10 seconds.")
+    interval_seconds = int(interval_seconds)
+    interval_minutes = interval_seconds / 60
     interval_raw = interval_seconds // 10
-
-    if interval_raw > 0xFFFF:
-        raise ValueError(
-            "A mintavételi időköz túl nagy az RC-5 számára."
-        )
+    if alarm_high is not None or alarm_low is not None:
+        if (isinstance(alarm_high, bool) or isinstance(alarm_low, bool)
+                or not isinstance(alarm_high, (int, float)) or not isinstance(alarm_low, (int, float))
+                or not math.isfinite(alarm_high) or not math.isfinite(alarm_low)
+                or not -399.9 <= alarm_low < alarm_high <= 399.9):
+            raise ValueError("Choose valid low/high alarm limits, with the low limit below the high limit.")
+    if probe not in (None, "internal", "external"):
+        raise ValueError("Probe must be internal or external.")
+    if temperature_unit not in (None, "C", "F"):
+        raise ValueError("Temperature unit must be C or F.")
 
     LOGGER.info(
-        "FACTORY FLOW START | version=%s | device=%s | interval_minutes=%d | "
+        "FACTORY FLOW START | version=%s | device=%s | interval_minutes=%.3f | "
         "sync_clock=%s | button_stop=%s | software_stop=%s | "
         "allow_data_loss=%s | expected_record_count=%s",
         APP_VERSION,
@@ -2383,17 +2583,11 @@ def apply_device_config(
         expected_record_count,
     )
 
-    expected_start_byte = None
-    expected_config_time = None
-
     with HID_LOCK:
-        fd = os.open(
-            device_path,
-            os.O_RDWR | os.O_NONBLOCK,
-        )
+        fd = open_device(device_path)
 
         try:
-            prime_parameter_session(
+            identity, _ = prime_parameter_session(
                 fd,
                 context="factory-save-precheck",
             )
@@ -2410,28 +2604,13 @@ def apply_device_config(
                 record_count,
             )
 
-            if expected_record_count is not None:
-                try:
-                    expected_record_count = int(expected_record_count)
-                except (TypeError, ValueError):
-                    raise RuntimeError(
-                        "Érvénytelen expected_record_count érték."
-                    )
-
-                if record_count != expected_record_count:
-                    raise RuntimeError(
-                        "A logger rekordszáma megváltozott a jóváhagyás óta: "
-                        f"a felület {expected_record_count} rekordot erősített meg, "
-                        f"de a készülék most {record_count} rekordot jelent. "
-                        "Olvasd újra a konfigurációt, majd erősítsd meg újra."
-                    )
-
-            if record_count != 0 and not allow_data_loss:
-                raise RuntimeError(
-                    f"A logger {record_count} tárolt mérési rekordot tartalmaz. "
-                    "A FormatCommand ezeket törölheti. A backend csak explicit "
-                    "allow_data_loss=true jóváhagyással engedi ezt a műveletet."
-                )
+            current_session_id = recording_session_id(
+                fd, identity, hid_get_parameter(fd, 0x28, 7)
+            )
+            validate_configuration_confirmation(
+                record_count, expected_record_count, current_session_id,
+                expected_session_id, allow_data_loss,
+            )
 
             if record_count != 0:
                 LOGGER.warning(
@@ -2443,9 +2622,14 @@ def apply_device_config(
 
             if protocol_version < 0x16:
                 raise RuntimeError(
-                    "Ez a gyári hat-packetes save-flow csak "
-                    "0x16 vagy újabb protokollverzióhoz használható."
+                    "Saving settings requires "
+                    "protocol version 0x16 or later."
                 )
+
+            if record_count and int.from_bytes(identity[:2], "big") == 0x0044 and protocol_version == 0x54:
+                archive = read_rc4_pro_records(fd, identity, record_count, capacity, 0)
+                save_recording_history(fd, identity, archive)
+                prime_parameter_session(fd, context="after-history-save")
 
             original_blocks = {}
 
@@ -2456,9 +2640,24 @@ def apply_device_config(
                     length,
                 )
 
+            backup_dir = Path(__file__).resolve().parent / ".device-backups"
+            backup_dir.mkdir(exist_ok=True)
+            backup_path = backup_dir / (datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".json")
+            backup_path.write_text(json.dumps({
+                "device_path": device_path,
+                "protocol_version": protocol_version,
+                "record_count": record_count,
+                "parameters": {f"0x{start:04X}": data.hex() for start, data in original_blocks.items()},
+            }, indent=2), encoding="utf-8")
+
             patched_blocks = _patch_compat_config_blocks(
                 original_blocks,
                 interval_minutes=interval_minutes,
+                interval_seconds=interval_seconds,
+                temperature_unit=temperature_unit,
+                probe=probe,
+                alarm_high=alarm_high,
+                alarm_low=alarm_low,
                 button_stop=button_stop,
                 software_stop=software_stop,
                 sync_clock=sync_clock,
@@ -2486,11 +2685,6 @@ def apply_device_config(
                     length,
                     ", ".join(diffs) if diffs else "(none)",
                 )
-
-            expected_start_byte = patched_blocks[0x00][0x20]
-
-            if sync_clock:
-                expected_config_time = patched_blocks[0x00][0x28:0x2F]
 
             # ------------------------------------------------
             # Exact factory packet order.
@@ -2541,7 +2735,14 @@ def apply_device_config(
                 "FACTORY FORMAT TX | op=0x02C0"
             )
 
-            format_response = hid_format_command(fd)
+            format_response = b""
+            try:
+                format_response = hid_format_command(fd)
+            except OSError as response_error:
+                # A flash erase/restart can finish without an input report.
+                # Preserve the settle/reopen sequence and verify the outcome;
+                # sending FormatCommand again could clear a newly started run.
+                LOGGER.warning("PREPARATION REPLY MISSING | verifying device state | %s", response_error)
 
             LOGGER.warning(
                 "FACTORY FORMAT RX | response_len=%d",
@@ -2556,102 +2757,45 @@ def apply_device_config(
             time.sleep(0.55)
 
         finally:
-            os.close(fd)
+            fd.close()
 
         LOGGER.info(
             "FACTORY HID CLOSED | waiting 1 second before reopen"
         )
         time.sleep(1.0)
 
-        fd = os.open(
-            device_path,
-            os.O_RDWR | os.O_NONBLOCK,
-        )
-
-        try:
-            verify_start = hid_get_parameter(fd, 0x20, 1)[0]
-            verify_interval = int.from_bytes(
-                hid_get_parameter(fd, 0x4C, 2),
-                byteorder="big",
-            )
-            verify_config_time = hid_get_parameter(fd, 0x28, 7)
-            verify_device_time = hid_get_parameter(fd, 0x88, 7)
-
-        finally:
-            os.close(fd)
-
-    LOGGER.info(
-        "FACTORY REOPEN VERIFY | interval_raw=%d | "
-        "interval_minutes=%.3f | start_byte=0x%02X | "
-        "config_time_raw=%s | config_time=%s | "
-        "device_time_raw=%s | device_time=%s",
-        verify_interval,
-        verify_interval * 10 / 60,
-        verify_start,
-        verify_config_time.hex(" "),
-        decode_datetime(verify_config_time),
-        verify_device_time.hex(" "),
-        decode_datetime(verify_device_time),
-    )
-
-    problems = []
-
-    if verify_interval != interval_raw:
-        problems.append(
-            "a mintavételi időköz az újranyitáskor nem egyezik"
-        )
-
-    if (
-        verify_start & 0b00011111
-    ) != (
-        expected_start_byte & 0b00011111
-    ):
-        problems.append(
-            "a start/stop bitek az újranyitáskor nem egyeznek"
-        )
-
-    if (
-        sync_clock
-        and expected_config_time is not None
-        and verify_config_time != expected_config_time
-    ):
-        problems.append(
-            "a konfigurációs idő az újranyitáskor nem egyezik"
-        )
-
-    if problems:
-        raise RuntimeError(
-            "A gyári save-flow rekonstrukció már a szoftveres "
-            "újranyitás után eltért: "
-            + "; ".join(problems)
-        )
+        readback = verify_preparation_readback(device_path, identity, patched_blocks, sync_clock)
+        verify_unit = "F" if readback["unit_probe"] & 0x08 else "C"
+        verify_probe = "external" if readback["unit_probe"] & 0x02 else "internal"
+        verify_device_time = readback["device_time"]
+        verify_config_time = readback["configuration_time"]
 
     return {
         "ok": True,
         "message": (
-            "A gyári ElitechLog V8.0.5.0 save-flow rekonstrukció "
-            "lefutott, és a HID újranyitása után az értékek még "
-            "megmaradtak. A végső NVM-teszt: húzd ki fizikailag az "
-            "RC-5-öt, várj 3 másodpercet, dugd vissza, majd olvasd "
-            "újra az Eszköz információkat."
+            "Settings saved and verified after reopening USB. "
+            "Unplug the logger, wait 3 seconds, then hold its button for 5 seconds "
+            "until the recording symbol appears."
         ),
         "write_mode": "elitechlog-v8.0.5.0-factory-flow",
+        "preparation_acknowledged": bool(format_response),
+        "verification": "device-readback",
+        "record_count_after_save": readback["record_count"],
         "protocol_version": protocol_version,
         "capacity": capacity,
         "record_count_before_save": record_count,
         "data_loss_confirmed": bool(record_count != 0 and allow_data_loss),
         "interval_minutes": interval_minutes,
-        "start_mode": "Kézi",
+        "interval_seconds": interval_seconds,
+        "temperature_unit": verify_unit,
+        "probe": verify_probe,
+        "start_mode": "Manual",
         "button_stop": bool(button_stop),
         "software_stop": bool(software_stop),
         "clock_sync_requested": bool(sync_clock),
         "device_time": decode_datetime(verify_device_time),
         "configuration_time": decode_datetime(verify_config_time),
-        "persistence_note": (
-            "Fontos: ez még csak szoftveres HID újranyitásos ellenőrzés. "
-            "A nem felejtő memória csak fizikai USB kihúzás/visszadugás "
-            "után igazolható."
-        ),
+        "persistence_note": "Reconnect USB later to download measurements.",
     }
 
 
@@ -2669,21 +2813,24 @@ UDEV_RULE = (
 
 
 def install_udev_rule():
+    if sys.platform == "win32":
+        raise RuntimeError("Windows uses its built-in HID driver; no udev rule is needed.")
+
     pkexec = shutil.which("pkexec")
     udevadm = shutil.which("udevadm")
     install_cmd = shutil.which("install")
 
     if not pkexec:
         raise RuntimeError(
-            "A pkexec nem található. Telepítsd a policykit-1 csomagot, "
-            "vagy állíts be kézzel udev szabályt."
+            "pkexec was not found. Install policykit-1 "
+            "or configure a udev rule manually."
         )
 
     if not udevadm:
-        raise RuntimeError("Az udevadm nem található.")
+        raise RuntimeError("udevadm was not found.")
 
     if not install_cmd:
-        raise RuntimeError("Az install parancs nem található.")
+        raise RuntimeError("The install command was not found.")
 
     tmp_path = None
 
@@ -2720,15 +2867,15 @@ def install_udev_rule():
             message = result.stderr.strip() or result.stdout.strip()
             if not message:
                 message = (
-                    "A jogosultság beállítása megszakadt vagy sikertelen volt."
+                    "USB access setup was cancelled or failed."
                 )
             raise RuntimeError(message)
 
         return {
             "ok": True,
             "message": (
-                "Az udev szabály telepítve. "
-                "Ha az eszköz továbbra sem olvasható, húzd ki és dugd vissza az RC-5-öt."
+                "USB access rule installed. "
+                "If the logger is still unavailable, unplug and reconnect it."
             ),
         }
 
@@ -2746,11 +2893,11 @@ def install_udev_rule():
 
 HTML = r"""
 <!doctype html>
-<html lang="hu">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Elitech RC-5 Manager</title>
+<title>Elitech USB Logger Manager</title>
 
 <style>
 * { box-sizing: border-box; }
@@ -3385,6 +3532,10 @@ button, input { font: inherit; }
     .form-row { grid-template-columns: 1fr; gap: 5px; }
     .config-footer { align-items: stretch; flex-direction: column; }
 }
+.content-title { display:none; }
+.sensor-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:7px; background:#9ca3af; }
+.sensor-dot.connected { background:#16a34a; }
+.device-item.offline { color:#6b7280; }
 </style>
 </head>
 
@@ -3392,22 +3543,32 @@ button, input { font: inherit; }
 <div class="app">
 
     <div class="header">
-        <h1>Elitech RC-5 Manager <span style="font-size:13px;font-weight:600;opacity:.65;">v21-tab-session-recovery</span></h1>
-        <div class="subtitle">USB HID eszközkezelő</div>
+        <h1>Elitech USB Logger Manager <span style="font-size:13px;font-weight:600;opacity:.65;">v26-sensor-library</span></h1>
+        <div class="subtitle">USB temperature logger</div>
+        <label for="displayUnit">Charts and CSV:
+            <select id="displayUnit" aria-label="Temperature display unit">
+                <option value="C">Celsius (°C)</option>
+                <option value="F">Fahrenheit (°F)</option>
+            </select>
+        </label>
     </div>
 
     <div class="layout">
 
         <aside class="sidebar">
             <div class="panel sidebar-panel">
-                <h2 class="sidebar-title">Elérhető eszközök</h2>
+                <h2 class="sidebar-title">Sensors</h2>
 
                 <div id="deviceList" class="device-list">
-                    <div class="device-list-empty">Eszközök keresése...</div>
+                    <div class="device-list-empty">Loading sensors...</div>
                 </div>
 
+                <label for="sensorNameInput">Sensor name</label>
+                <input id="sensorNameInput" class="form-control" placeholder="Select a sensor" maxlength="100" disabled>
+                <button id="saveSensorName" type="button" class="action-button" disabled>Save name</button>
+                <details style="margin-top:12px;"><summary>Database location</summary><code id="databaseLocation" style="display:block;overflow-wrap:anywhere;font-size:11px;"></code></details>
                 <div id="deviceStatus" class="device-status offline">
-                    Eszközök keresése...
+                    Loading sensors...
                 </div>
             </div>
         </aside>
@@ -3416,58 +3577,54 @@ button, input { font: inherit; }
             <div class="panel">
 
                 <div class="tabs">
-                    <button id="infoTabButton" type="button" class="tab-button active">
-                        Eszköz információk
+                    <button id="infoTabButton" type="button" class="tab-button">
+                        Device information
                     </button>
 
                     <button id="configTabButton" type="button" class="tab-button">
-                        Mérés konfigurálása
+                        Prepare logging
                     </button>
 
-                    <button id="measurementsTabButton" type="button" class="tab-button">
-                        Mérési eredmények
+                    <button id="measurementsTabButton" type="button" class="tab-button active">
+                        Measurements
                     </button>
                 </div>
 
                 <div class="tab-content">
 
-                    <section id="infoTabPage" class="tab-page active">
+                    <section id="infoTabPage" class="tab-page">
                         <div id="infoEmptyState" class="empty-state">
-                            Válassz egy Elitech RC-5 eszközt a bal oldali listából.
+                            Select an Elitech logger from the list on the left.
                         </div>
 
                         <div id="infoContent" style="display:none;">
                             <div class="content-header">
-                                <div class="content-title">
-                                    <h2 id="selectedDeviceName">Elitech RC-5</h2>
-                                    <div id="selectedDevicePath" class="device-path"></div>
-                                </div>
 
                                 <button
                                     id="refreshInfoButton"
                                     type="button"
                                     class="action-button"
                                 >
-                                    Frissítés
+                                    Refresh
                                 </button>
                             </div>
 
                             <div id="infoLoading" class="loading">
-                                Adatok lekérdezése...
+                                Reading device information...
                             </div>
 
                             <div id="infoErrorBox" class="error-box"></div>
 
                             <div id="permissionBox" class="permission-box">
-                                Az RC-5 felismerhető, de nincs megfelelő
-                                HID-jogosultság.
+                                The logger was found but requires
+                                USB access permission.
                                 <br><br>
                                 <button
                                     id="permissionButton"
                                     type="button"
                                     class="action-button"
                                 >
-                                    USB-jogosultság beállítása
+                                    Set up USB access
                                 </button>
                             </div>
 
@@ -3480,34 +3637,30 @@ button, input { font: inherit; }
                     <section id="configTabPage" class="tab-page">
 
                         <div id="configEmptyState" class="empty-state">
-                            Válassz egy Elitech RC-5 eszközt a bal oldali listából.
+                            Select an Elitech logger from the list on the left.
                         </div>
 
                         <div id="configContent" style="display:none;">
                             <div class="content-header">
-                                <div class="content-title">
-                                    <h2 id="configDeviceName">Elitech RC-5</h2>
-                                    <div id="configDevicePath" class="device-path"></div>
-                                </div>
 
                                 <button
                                     id="reloadConfigButton"
                                     type="button"
                                     class="action-button"
                                 >
-                                    Beállítások újraolvasása
+                                    Reload settings
                                 </button>
                             </div>
 
                             <div class="config-intro">
-                                Ez a tab a logger előkészítésére szolgál.
-                                <strong>A mérés mentés után sem indul el.</strong>
-                                A program minden mentéskor kézi indítási módot állít be,
-                                így a mérés külön, a készülék ▶ gombjával indítható.
+                                <strong>Prepare the logger for a new recording session.</strong>
+                                Choose an interval and temperature unit, then save.
+                                After saving, unplug USB and hold the logger's button for 5 seconds
+                                until the recording symbol appears. A flashing symbol means a start delay.
                             </div>
 
                             <div id="configLoading" class="loading">
-                                Konfiguráció beolvasása...
+                                Reading settings...
                             </div>
 
                             <div id="configErrorBox" class="error-box"></div>
@@ -3519,11 +3672,11 @@ button, input { font: inherit; }
                                 <div class="config-grid">
 
                                     <section class="config-section">
-                                        <h3>Mintavétel</h3>
+                                        <h3>Logging interval</h3>
 
                                         <div class="form-row">
                                             <label for="sampleInterval">
-                                                Mintavételi időköz
+                                                Logging interval
                                             </label>
 
                                             <div>
@@ -3532,18 +3685,20 @@ button, input { font: inherit; }
                                                         id="sampleInterval"
                                                         class="form-control"
                                                         type="number"
-                                                        min="1"
-                                                        max="1440"
-                                                        step="1"
-                                                        value="30"
+                                                        min="0.01"
+                                                        max="86400"
+                                                        step="any"
+                                                        value="5"
                                                     >
-                                                    <span>perc</span>
+                                                    <select id="intervalUnit" class="form-control" aria-label="Interval unit">
+                                                        <option value="1">seconds</option>
+                                                        <option value="60" selected>minutes</option>
+                                                        <option value="3600">hours</option>
+                                                    </select>
                                                 </div>
 
                                                 <div class="hint">
-                                                    A készülék 10 másodperces
-                                                    felbontásban tárolja az intervallumot;
-                                                    itt egész perceket használunk.
+                                                    From 10 seconds to 24 hours, in 10-second steps.
                                                 </div>
                                             </div>
                                         </div>
@@ -3551,30 +3706,51 @@ button, input { font: inherit; }
 
 
                                     <section class="config-section">
-                                        <h3>Indítás</h3>
+                                        <h3>Start recording</h3>
+                                        <div class="form-row">
+                                            <label for="probeSelection">Temperature probe</label>
+                                            <div>
+                                                <input id="probeSelection" type="hidden" value="internal">
+                                                <label style="color:#2563eb;margin-right:12px;"><input id="probeInternal" type="radio" name="probe" value="internal" checked> Internal</label>
+                                                <label style="color:#ea580c;"><input id="probeExternal" type="radio" name="probe" value="external"> External</label>
+                                            </div>
+                                        </div>
+                                        <div class="hint">RC-4 Pro records one selected temperature probe per session.</div>
+                                        <div class="form-row">
+                                            <label for="temperatureUnit">Logger temperature unit</label>
+                                            <select id="temperatureUnit" class="form-control">
+                                                <option value="C">Celsius (°C)</option>
+                                                <option value="F">Fahrenheit (°F)</option>
+                                            </select>
+                                        </div>
 
                                         <div class="form-row">
                                             <label>
-                                                Indítási mód
+                                                Start mode
                                             </label>
 
                                             <input
                                                 class="form-control"
-                                                value="Kézi — a készülék ▶ gombjával"
+                                                value="Manual — hold the logger button for 5 seconds"
                                                 disabled
                                             >
                                         </div>
 
                                         <div class="hint">
-                                            Azonnali és időzített indítást szándékosan
-                                            nem engedünk ezen a képernyőn, hogy a
-                                            konfiguráció mentése ne indíthassa el a mérést.
+                                            After saving, unplug USB and hold the button for 5 seconds. Confirm the recording symbol on the logger.
                                         </div>
                                     </section>
 
 
                                     <section class="config-section">
-                                        <h3>Készülék órája</h3>
+                                        <h3>Temperature alarms</h3>
+                                        <div class="form-row"><label for="alarmHigh">High limit</label><input id="alarmHigh" class="form-control" type="number" step="0.1"></div>
+                                        <div class="form-row"><label for="alarmLow">Low limit</label><input id="alarmLow" class="form-control" type="number" step="0.1"></div>
+                                        <div class="hint">Limits use the logger temperature unit above. Changing units converts the limits.</div>
+                                        <button id="resetAlarmLimits" type="button" class="action-button">Use default limits</button>
+                                    </section>
+                                    <section class="config-section">
+                                        <h3>Logger clock</h3>
 
                                         <div class="checkbox-row">
                                             <input
@@ -3584,14 +3760,14 @@ button, input { font: inherit; }
                                             >
 
                                             <label for="syncClock">
-                                                Óra szinkronizálása a számítógép
-                                                aktuális idejéhez mentéskor
+                                                Synchronize the logger clock with this computer
+                                                when saving
                                             </label>
                                         </div>
 
                                         <div class="form-row">
                                             <label>
-                                                Készülék jelenlegi ideje
+                                                Current logger time
                                             </label>
 
                                             <input
@@ -3604,7 +3780,7 @@ button, input { font: inherit; }
 
                                         <div class="form-row">
                                             <label>
-                                                Számítógép ideje
+                                                Computer time
                                             </label>
 
                                             <input
@@ -3618,7 +3794,7 @@ button, input { font: inherit; }
 
 
                                     <section class="config-section">
-                                        <h3>Leállítás engedélyezése</h3>
+                                        <h3>Stopping options</h3>
 
                                         <div class="checkbox-row">
                                             <input
@@ -3627,7 +3803,7 @@ button, input { font: inherit; }
                                             >
 
                                             <label for="allowButtonStop">
-                                                Leállítás engedélyezése a készülék gombjával
+                                                Allow stopping with the logger button
                                             </label>
                                         </div>
 
@@ -3638,19 +3814,19 @@ button, input { font: inherit; }
                                             >
 
                                             <label for="allowSoftwareStop">
-                                                Szoftveres leállítás engedélyezése
+                                                Allow stopping from software
                                             </label>
                                         </div>
                                     </section>
 
 
                                     <section class="config-section">
-                                        <h3>Memória / biztonság</h3>
+                                        <h3>Memory</h3>
 
                                         <div class="preview-grid">
                                             <div class="preview-item">
                                                 <div class="preview-label">
-                                                    Logger kapacitása
+                                                    Logger capacity
                                                 </div>
                                                 <div id="configCapacity" class="preview-value">
                                                     —
@@ -3659,7 +3835,7 @@ button, input { font: inherit; }
 
                                             <div class="preview-item">
                                                 <div class="preview-label">
-                                                    Tárolt mérések
+                                                    Stored measurements
                                                 </div>
                                                 <div id="configRecordCount" class="preview-value">
                                                     —
@@ -3668,7 +3844,7 @@ button, input { font: inherit; }
 
                                             <div class="preview-item">
                                                 <div class="preview-label">
-                                                    Konfigurálható
+                                                    Ready to configure
                                                 </div>
                                                 <div id="configAllowed" class="preview-value">
                                                     —
@@ -3677,41 +3853,38 @@ button, input { font: inherit; }
                                         </div>
 
                                         <div class="hint">
-                                            A program nem enged újrakonfigurálást, ha a
-                                            logger már mérési rekordokat tartalmaz.
-                                            A rekordok előbb a Mérési eredmények tabon
-                                            olvashatók ki és exportálhatók.
+                                            Export any measurements before preparing a new session. Saving settings clears the stored measurements.
                                         </div>
                                     </section>
 
 
                                     <section class="config-section">
-                                        <h3>Tervezett mérés</h3>
+                                        <h3>Recording capacity</h3>
 
                                         <div class="preview-grid">
                                             <div class="preview-item">
                                                 <div class="preview-label">
-                                                    Rekord / nap
+                                                    Days
                                                 </div>
-                                                <div id="recordsPerDay" class="preview-value">
+                                                <div id="durationDays" class="preview-value">
                                                     —
                                                 </div>
                                             </div>
 
                                             <div class="preview-item">
                                                 <div class="preview-label">
-                                                    Rekord / év
+                                                    Months
                                                 </div>
-                                                <div id="recordsPerYear" class="preview-value">
+                                                <div id="durationMonths" class="preview-value">
                                                     —
                                                 </div>
                                             </div>
 
                                             <div class="preview-item">
                                                 <div class="preview-label">
-                                                    Memória becsült időtartama
+                                                    Years
                                                 </div>
-                                                <div id="memoryDuration" class="preview-value">
+                                                <div id="durationYears" class="preview-value">
                                                     —
                                                 </div>
                                             </div>
@@ -3720,17 +3893,13 @@ button, input { font: inherit; }
 
 
                                     <section class="config-section full-width">
-                                        <h3>Konfiguráció alkalmazása</h3>
+                                        <h3>Prepare a new session</h3>
 
                                         <div class="config-footer">
                                             <div class="config-footer-text">
-                                                Ez a verzió már nem a régi python-elitech mintáját követi,
-                                                hanem az ElitechLog Win V8.0.5.0-ból statikusan
-                                                visszafejtett gyári save-flow-t: 6 SetParameter
-                                                packet, gyári dátumformátum, FormatCommand, majd
-                                                500 ms-os nyitva tartás és HID újranyitás. Ha a logger
-                                                már tartalmaz méréseket, a FormatCommand törölheti őket;
-                                                ilyenkor a mentés csak kettős megerősítés után indul el.
+                                                Saving synchronizes the clock (if selected) and prepares a new session.
+                                                Existing measurements will be erased; export them first.
+                                                Start recording with the device button after unplugging USB.
                                             </div>
 
                                             <button
@@ -3739,7 +3908,7 @@ button, input { font: inherit; }
                                                 class="save-button"
                                                 disabled
                                             >
-                                                Konfiguráció mentése
+                                                Save and prepare logging
                                             </button>
                                         </div>
                                     </section>
@@ -3750,53 +3919,45 @@ button, input { font: inherit; }
                     </section>
 
 
-                    <section id="measurementsTabPage" class="tab-page">
+                    <section id="measurementsTabPage" class="tab-page active">
 
                         <div id="measurementsEmptyState" class="empty-state">
-                            Válassz egy Elitech RC-5 eszközt a bal oldali listából.
+                            Select an Elitech logger from the list on the left.
                         </div>
 
                         <div id="measurementsContent" style="display:none;">
-                            <div class="content-header">
-                                <div class="content-title">
-                                    <h2 id="measurementsDeviceName">Elitech RC-5</h2>
-                                    <div id="measurementsDevicePath" class="device-path"></div>
-                                </div>
-                            </div>
-
                             <div class="config-intro">
-                                A rekordok kiolvasása <strong>csak olvasási művelet</strong>.
-                                A v16 a gyári ElitechLog V8.0.5.0 teljes
-                                17-packetes kapcsolódási read preamble-ját is
-                                reprodukálja, majd GetRecord packeteket küld.
-                                Az új hardver ACK-only válaszait külön kezeli,
-                                és nem dobja el a késve érkező HID reportokat.
+                                Measurements are shown from the local database. Connecting USB automatically downloads new readings. Internal and external readings are color coded.
                             </div>
 
                             <div class="measurement-toolbar">
                                 <div class="measurement-toolbar-group">
                                     <div class="measurement-control">
-                                        <label for="measurementLimit">
-                                            Betöltendő rekordok
-                                        </label>
-
-                                        <select
-                                            id="measurementLimit"
-                                            class="form-control"
-                                        >
-                                            <option value="100">Utolsó 100</option>
-                                            <option value="500" selected>Utolsó 500</option>
-                                            <option value="2000">Utolsó 2000</option>
-                                            <option value="0">Összes</option>
+                                        <label for="measurementRangePreset">Time range</label>
+                                        <select id="measurementRangePreset" class="form-control">
+                                            <option value="today" selected>Today</option>
+                                            <option value="yesterday">Yesterday</option>
+                                            <option value="week">Last 7 days</option>
+                                            <option value="month">Last 30 days</option>
+                                            <option value="all">All history</option>
+                                            <option value="custom">Custom</option>
                                         </select>
                                     </div>
-
+                                    <div class="measurement-control">
+                                        <label for="measurementStart">From (local time)</label>
+                                        <input id="measurementStart" type="datetime-local" step="1" class="form-control">
+                                    </div>
+                                    <div class="measurement-control">
+                                        <label for="measurementEnd">To (exclusive)</label>
+                                        <input id="measurementEnd" type="datetime-local" step="1" class="form-control">
+                                    </div>
+                                    <button id="applyMeasurementRange" type="button" class="action-button">Apply range</button>
                                     <button
                                         id="reloadMeasurementsButton"
                                         type="button"
                                         class="action-button"
                                     >
-                                        Mérések beolvasása
+                                        Sync now
                                     </button>
                                 </div>
 
@@ -3806,12 +3967,12 @@ button, input { font: inherit; }
                                     class="action-button"
                                     disabled
                                 >
-                                    CSV letöltés
+                                    Export CSV
                                 </button>
                             </div>
 
                             <div id="measurementsLoading" class="loading">
-                                Mérési rekordok beolvasása...
+                                Loading saved measurements...
                             </div>
 
                             <div id="measurementsErrorBox" class="error-box"></div>
@@ -3822,17 +3983,17 @@ button, input { font: inherit; }
                                 class="preview-grid measurement-summary"
                             >
                                 <div class="preview-item">
-                                    <div class="preview-label">Tárolt rekord</div>
+                                    <div class="preview-label">Stored records</div>
                                     <div id="measurementStoredCount" class="preview-value">—</div>
                                 </div>
 
                                 <div class="preview-item">
-                                    <div class="preview-label">Betöltve</div>
+                                    <div class="preview-label">In time range</div>
                                     <div id="measurementLoadedCount" class="preview-value">—</div>
                                 </div>
 
                                 <div class="preview-item">
-                                    <div class="preview-label">Időszak</div>
+                                    <div class="preview-label">Period</div>
                                     <div id="measurementPeriod" class="preview-value">—</div>
                                 </div>
 
@@ -3842,7 +4003,7 @@ button, input { font: inherit; }
                                 </div>
 
                                 <div class="preview-item">
-                                    <div class="preview-label">Átlag</div>
+                                    <div class="preview-label">Average</div>
                                     <div id="measurementAvg" class="preview-value">—</div>
                                 </div>
 
@@ -3854,11 +4015,18 @@ button, input { font: inherit; }
 
                             <div id="measurementChartWrap" class="measurement-chart-wrap">
                                 <div class="measurement-chart-title">
-                                    Hőmérséklet-idősor
+                                    Temperature over time
+                                    <span style="color:#2563eb;margin-left:16px;">● Internal</span>
+                                    <span style="color:#ea580c;margin-left:10px;">● External</span>
+                                </div>
+                                <div class="measurement-toolbar-group" style="margin-bottom:10px;">
+                                    <button id="measurementZoomIn" type="button" class="action-button" aria-label="Zoom in on time">Zoom in (+)</button>
+                                    <button id="measurementZoomOut" type="button" class="action-button" aria-label="Zoom out on time">Zoom out (−)</button>
+                                    <button id="measurementToday" type="button" class="action-button">Today</button>
                                 </div>
                                 <div id="measurementChart" class="measurement-chart"></div>
                                 <div class="measurement-chart-help">
-                                    Mozgasd az egeret a grafikon fölött a legközelebbi mérési pont kiemeléséhez.
+                                    Hover to inspect. Drag across the chart to zoom into a time range. Double-click to zoom out.
                                 </div>
                             </div>
 
@@ -3867,18 +4035,19 @@ button, input { font: inherit; }
                                     <thead>
                                         <tr>
                                             <th>#</th>
-                                            <th>Időpont</th>
-                                            <th>Hőmérséklet</th>
-                                            <th>Páratartalom</th>
-                                            <th>Állapot</th>
-                                            <th>Jelzők</th>
+                                            <th>Time</th>
+                                            <th>Temperature</th>
+                                            <th>Humidity</th>
+                                            <th>Probe</th>
+                                            <th>Status</th>
+                                            <th>Flags</th>
                                         </tr>
                                     </thead>
 
                                     <tbody id="measurementTableBody">
                                         <tr>
-                                            <td colspan="6" class="measurement-empty">
-                                                Még nincs betöltött mérési adat.
+                                            <td colspan="7" class="measurement-empty">
+                                                No measurements in this time range.
                                             </td>
                                         </tr>
                                     </tbody>
@@ -3886,12 +4055,7 @@ button, input { font: inherit; }
                             </div>
 
                             <div class="measurement-note">
-                                A táblázat és a CSV páratartalom-mezőt is megtart
-                                a későbbi, páratartalom-képes Elitech modellekhez.
-                                Ennél az RC-5-nél ez jelenleg „—”. A grafikon
-                                időtengelye automatikusan alkalmazkodik a mérési
-                                időszak hosszához, az egérrel pedig a legközelebbi
-                                valódi adatpont emelhető ki.
+                                Measurements are downloaded directly over USB HID. RC-4 Pro records the selected internal or external temperature probe. Humidity is unavailable on this temperature-only model.
                             </div>
                         </div>
                     </section>
@@ -3932,10 +4096,11 @@ button, input { font: inherit; }
 
 <script>
 const APP_TOKEN = "__APP_TOKEN__";
+const IS_WINDOWS = __IS_WINDOWS__;
 
 let devices = [];
-let selectedDevicePath = "";
-let activeTab = "info";
+let selectedSerial = "";
+let activeTab = "measurements";
 
 let infoBusy = false;
 let configBusy = false;
@@ -3944,6 +4109,7 @@ let permissionBusy = false;
 
 let currentCapacity = 32000;
 let currentRecordCount = null;
+let currentSessionId = null;
 let configLoaded = false;
 let measurementsLoaded = false;
 let loadedMeasurementRecords = [];
@@ -3961,8 +4127,6 @@ const measurementsTabPage = document.getElementById("measurementsTabPage");
 
 const infoEmptyState = document.getElementById("infoEmptyState");
 const infoContent = document.getElementById("infoContent");
-const selectedDeviceName = document.getElementById("selectedDeviceName");
-const selectedDevicePathEl = document.getElementById("selectedDevicePath");
 const refreshInfoButton = document.getElementById("refreshInfoButton");
 const infoLoading = document.getElementById("infoLoading");
 const infoErrorBox = document.getElementById("infoErrorBox");
@@ -3973,8 +4137,6 @@ const infoGrid = document.getElementById("infoGrid");
 
 const configEmptyState = document.getElementById("configEmptyState");
 const configContent = document.getElementById("configContent");
-const configDeviceName = document.getElementById("configDeviceName");
-const configDevicePath = document.getElementById("configDevicePath");
 const reloadConfigButton = document.getElementById("reloadConfigButton");
 const configLoading = document.getElementById("configLoading");
 const configErrorBox = document.getElementById("configErrorBox");
@@ -3982,6 +4144,22 @@ const configSuccessBox = document.getElementById("configSuccessBox");
 const configWarningBox = document.getElementById("configWarningBox");
 
 const sampleInterval = document.getElementById("sampleInterval");
+const intervalUnit = document.getElementById("intervalUnit");
+const temperatureUnit = document.getElementById("temperatureUnit");
+const probeSelection = document.getElementById("probeSelection");
+const probeInternal = document.getElementById("probeInternal");
+const probeExternal = document.getElementById("probeExternal");
+const sensorNameInput = document.getElementById("sensorNameInput");
+const saveSensorName = document.getElementById("saveSensorName");
+const alarmHigh = document.getElementById("alarmHigh");
+const alarmLow = document.getElementById("alarmLow");
+const displayUnit = document.getElementById("displayUnit");
+try { displayUnit.value = localStorage.getItem("elitechTemperatureUnit") === "F" ? "F" : "C"; } catch (_) {}
+let lastMeasurementData = null;
+let measurementRequestSequence = 0;
+function intervalSeconds() { return Number(sampleInterval.value) * Number(intervalUnit.value); }
+function probeColor(probe) { return probe === "internal" ? "#2563eb" : probe === "external" ? "#ea580c" : "#6b7280"; }
+function displayTemperature(celsius) { return displayUnit.value === "F" ? celsius * 9 / 5 + 32 : celsius; }
 const syncClock = document.getElementById("syncClock");
 const currentDeviceTime = document.getElementById("currentDeviceTime");
 const computerTime = document.getElementById("computerTime");
@@ -3990,9 +4168,9 @@ const allowSoftwareStop = document.getElementById("allowSoftwareStop");
 const configCapacity = document.getElementById("configCapacity");
 const configRecordCount = document.getElementById("configRecordCount");
 const configAllowed = document.getElementById("configAllowed");
-const recordsPerDay = document.getElementById("recordsPerDay");
-const recordsPerYear = document.getElementById("recordsPerYear");
-const memoryDuration = document.getElementById("memoryDuration");
+const durationDays = document.getElementById("durationDays");
+const durationMonths = document.getElementById("durationMonths");
+const durationYears = document.getElementById("durationYears");
 const saveConfigButton = document.getElementById("saveConfigButton");
 
 const safetyModalBackdrop = document.getElementById("safetyModalBackdrop");
@@ -4002,9 +4180,10 @@ const safetyModalActions = document.getElementById("safetyModalActions");
 
 const measurementsEmptyState = document.getElementById("measurementsEmptyState");
 const measurementsContent = document.getElementById("measurementsContent");
-const measurementsDeviceName = document.getElementById("measurementsDeviceName");
-const measurementsDevicePath = document.getElementById("measurementsDevicePath");
-const measurementLimit = document.getElementById("measurementLimit");
+const measurementRangePreset = document.getElementById("measurementRangePreset");
+const measurementStart = document.getElementById("measurementStart");
+const measurementEnd = document.getElementById("measurementEnd");
+let measurementRange = null;
 const reloadMeasurementsButton = document.getElementById("reloadMeasurementsButton");
 const exportCsvButton = document.getElementById("exportCsvButton");
 const measurementsLoading = document.getElementById("measurementsLoading");
@@ -4022,7 +4201,7 @@ const measurementTableBody = document.getElementById("measurementTableBody");
 
 
 function currentDevice() {
-    return devices.find(device => device.path === selectedDevicePath);
+    return devices.find(device => device.serial_number === selectedSerial);
 }
 
 
@@ -4047,6 +4226,8 @@ function clearMeasurementMessages() {
 
 
 function resetMeasurementView() {
+    measurementRequestSequence++;
+    lastMeasurementData = null;
     measurementsLoaded = false;
     loadedMeasurementRecords = [];
 
@@ -4065,9 +4246,9 @@ function resetMeasurementView() {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
 
-    cell.colSpan = 6;
+    cell.colSpan = 7;
     cell.className = "measurement-empty";
-    cell.textContent = "Még nincs betöltött mérési adat.";
+    cell.textContent = "No measurements in this time range.";
 
     row.appendChild(cell);
     measurementTableBody.appendChild(row);
@@ -4078,168 +4259,113 @@ function resetMeasurementView() {
 
 function updateDeviceHeaders() {
     const device = currentDevice();
-
-    if (!device) {
-        infoEmptyState.style.display = "flex";
-        infoContent.style.display = "none";
-        configEmptyState.style.display = "flex";
-        configContent.style.display = "none";
-        measurementsEmptyState.style.display = "flex";
-        measurementsContent.style.display = "none";
-        return;
-    }
-
-    infoEmptyState.style.display = "none";
-    infoContent.style.display = "block";
-
-    configEmptyState.style.display = "none";
-    configContent.style.display = "block";
-
-    measurementsEmptyState.style.display = "none";
-    measurementsContent.style.display = "block";
-
-    selectedDeviceName.textContent = device.name || "Elitech RC-5";
-    selectedDevicePathEl.textContent =
-        device.path + " · " + device.vendor_id + ":" + device.product_id;
-
-    configDeviceName.textContent = device.name || "Elitech RC-5";
-    configDevicePath.textContent =
-        device.path + " · " + device.vendor_id + ":" + device.product_id;
-
-    measurementsDeviceName.textContent = device.name || "Elitech RC-5";
-    measurementsDevicePath.textContent =
-        device.path + " · " + device.vendor_id + ":" + device.product_id;
+    infoEmptyState.style.display = device ? "none" : "flex";
+    infoContent.style.display = device ? "block" : "none";
+    configEmptyState.style.display = device?.connected ? "none" : "flex";
+    configEmptyState.textContent = device ? "Reconnect this sensor to change its settings." : "Select a sensor.";
+    configContent.style.display = device?.connected ? "block" : "none";
+    measurementsEmptyState.style.display = device ? "none" : "flex";
+    measurementsEmptyState.textContent = "Select a sensor to view its saved measurements.";
+    measurementsContent.style.display = device ? "block" : "none";
+    sensorNameInput.disabled = !device;
+    saveSensorName.disabled = !device;
+    if (device && document.activeElement !== sensorNameInput) sensorNameInput.value = device.name;
+    reloadMeasurementsButton.textContent = device?.syncing ? "Syncing…" : "Sync now";
+    reloadMeasurementsButton.disabled = !device?.connected || device?.syncing;
 }
 
+function sensorFingerprint(device) {
+    return device ? `${device.serial_number}:${device.saved_count}:${device.recording_count}:${device.data_updated}` : "";
+}
 
-function selectDevice(path) {
-    if (selectedDevicePath === path) {
-        return;
-    }
-
-    selectedDevicePath = path;
+function selectDevice(serial) {
+    if (selectedSerial === serial) { renderDeviceList(); updateDeviceHeaders(); return; }
+    selectedSerial = serial;
     configLoaded = false;
     currentRecordCount = null;
+    currentSessionId = null;
     resetMeasurementView();
-
-    renderDeviceList();
-    updateDeviceHeaders();
-
-    infoGrid.innerHTML = "";
-    clearInfoMessages();
-    clearConfigMessages();
-    clearMeasurementMessages();
-
-    if (!selectedDevicePath) {
-        return;
-    }
-
-    if (activeTab === "info") {
-        refreshDeviceInfo();
-    } else if (activeTab === "config") {
-        loadDeviceConfig();
-    } else {
-        loadDeviceMeasurements();
-    }
+    clearInfoMessages(); clearConfigMessages(); clearMeasurementMessages();
+    renderDeviceList(); updateDeviceHeaders();
+    const device = currentDevice();
+    if (!device) return;
+    currentCapacity = device.metadata?.capacity || 64000;
+    updateConfigPreview();
+    if (activeTab === "info") refreshDeviceInfo();
+    else if (activeTab === "config" && device.connected) loadDeviceConfig();
+    else if (activeTab === "measurements") loadDeviceMeasurements();
 }
 
-
 function renderDeviceList() {
-    deviceList.innerHTML = "";
-
-    if (devices.length === 0) {
-        const empty = document.createElement("div");
-        empty.className = "device-list-empty";
-        empty.textContent = "Nincs elérhető RC-5";
-        deviceList.appendChild(empty);
-
-        selectedDevicePath = "";
-        deviceStatus.textContent = "Nincs csatlakoztatott RC-5.";
-        deviceStatus.className = "device-status offline";
-
-        updateDeviceHeaders();
-        return;
-    }
-
+    deviceList.replaceChildren();
     for (const device of devices) {
         const item = document.createElement("button");
         item.type = "button";
-        item.className =
-            "device-item" +
-            (device.path === selectedDevicePath ? " selected" : "");
-
+        item.className = "device-item" + (device.serial_number === selectedSerial ? " selected" : "") + (!device.connected ? " offline" : "");
         const name = document.createElement("span");
         name.className = "device-item-name";
-        name.textContent = device.name || "Elitech RC-5";
-
+        const dot = document.createElement("span");
+        dot.className = "sensor-dot" + (device.connected ? " connected" : "");
+        dot.setAttribute("aria-label", device.connected ? "Connected" : "Offline");
+        const label = document.createElement("span");
+        label.textContent = device.name;
+        name.appendChild(dot); name.appendChild(label);
         const meta = document.createElement("span");
         meta.className = "device-item-meta";
-        meta.textContent =
-            device.path + " · " + device.vendor_id + ":" + device.product_id;
-
-        item.appendChild(name);
-        item.appendChild(meta);
-
-        item.addEventListener("click", () => {
-            selectDevice(device.path);
-        });
-
+        meta.textContent = `${device.serial_number} · ${device.syncing ? "Syncing…" : device.connected ? "Connected" : "Offline"} · ${device.saved_count} saved`;
+        if (device.error) meta.title = device.error;
+        item.appendChild(name); item.appendChild(meta);
+        item.addEventListener("click", () => selectDevice(device.serial_number));
         deviceList.appendChild(item);
     }
-
-    deviceStatus.textContent =
-        devices.length + " kompatibilis eszköz csatlakoztatva.";
-    deviceStatus.className = "device-status online";
+    if (!devices.length) {
+        const empty = document.createElement("div");
+        empty.className = "device-list-empty"; empty.textContent = "Connect a logger to add it.";
+        deviceList.appendChild(empty);
+    }
+    deviceStatus.textContent = `${devices.filter(item => item.connected).length} connected · ${devices.length} known sensors`;
 }
-
 
 async function refreshDevices() {
     try {
-        const response = await fetch("/api/devices?t=" + Date.now());
-
-        if (!response.ok) {
-            throw new Error("HTTP " + response.status);
-        }
-
-        const oldSelection = selectedDevicePath;
-        devices = await response.json();
-
-        const stillExists = devices.some(
-            device => device.path === oldSelection
-        );
-
-        if (!stillExists) {
-            if (devices.length === 1) {
-                selectedDevicePath = devices[0].path;
-            } else {
-                selectedDevicePath = "";
-            }
-
-            configLoaded = false;
-            currentRecordCount = null;
-            resetMeasurementView();
-        }
-
-        const selectionChanged = oldSelection !== selectedDevicePath;
-
-        renderDeviceList();
-        updateDeviceHeaders();
-
-        if (selectionChanged && selectedDevicePath) {
-            if (activeTab === "info") {
-                refreshDeviceInfo();
-            } else if (activeTab === "config") {
-                loadDeviceConfig();
-            } else {
-                loadDeviceMeasurements();
-            }
+        const response = await fetch("/api/sensors");
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || "Could not load sensors.");
+        const previous = devices;
+        const oldDevice = currentDevice();
+        const before = sensorFingerprint(oldDevice);
+        devices = payload.sensors;
+        document.getElementById("databaseLocation").textContent = payload.database_path;
+        const newlyConnected = devices.find(item => item.connected && !previous.some(old => old.serial_number === item.serial_number && old.connected));
+        if (!currentDevice() || (!currentDevice().connected && newlyConnected)) {
+            selectDevice(newlyConnected?.serial_number || devices.find(item => item.connected)?.serial_number || devices[0]?.serial_number || "");
+        } else {
+            renderDeviceList(); updateDeviceHeaders();
+            if (activeTab === "measurements" && before !== sensorFingerprint(currentDevice())) loadDeviceMeasurements();
+            if (activeTab === "info") refreshDeviceInfo();
+            if (activeTab === "config" && !oldDevice?.connected && currentDevice()?.connected) loadDeviceConfig();
         }
     } catch (error) {
-        deviceStatus.textContent = "A háttérfolyamat nem érhető el.";
-        deviceStatus.className = "device-status offline";
+        deviceStatus.textContent = error.message;
     }
 }
 
+async function renameSelectedSensor() {
+    if (!selectedSerial) return;
+    const response = await fetch("/api/sensor-name", {method:"POST",
+        headers:{"Content-Type":"application/json", "X-Elitech-Token":APP_TOKEN},
+        body:JSON.stringify({serial:selectedSerial, name:sensorNameInput.value})});
+    const data = await response.json();
+    if (!response.ok) { deviceStatus.textContent = data.error; return; }
+    await refreshDevices();
+}
+
+async function syncSelectedSensor() {
+    if (!currentDevice()?.connected) return;
+    await fetch("/api/sync", {method:"POST", headers:{"Content-Type":"application/json", "X-Elitech-Token":APP_TOKEN},
+        body:JSON.stringify({serial:selectedSerial})});
+    await refreshDevices();
+}
 
 function renderInfoFields(fields) {
     infoGrid.innerHTML = "";
@@ -4263,103 +4389,32 @@ function renderInfoFields(fields) {
 }
 
 
-async function refreshDeviceInfo() {
-    if (!selectedDevicePath || infoBusy) {
-        return;
-    }
-
-    infoBusy = true;
-    const requestedPath = selectedDevicePath;
-
-    infoLoading.style.display = "block";
-    refreshInfoButton.disabled = true;
-    clearInfoMessages();
-
-    try {
-        const response = await fetch(
-            "/api/device-info?path=" +
-            encodeURIComponent(requestedPath) +
-            "&t=" +
-            Date.now()
-        );
-
-        const data = await response.json();
-
-        if (requestedPath !== selectedDevicePath) {
-            return;
-        }
-
-        if (!response.ok) {
-            if (
-                response.status === 403 &&
-                data.code === "permission_denied"
-            ) {
-                infoGrid.innerHTML = "";
-                permissionBox.style.display = "block";
-                return;
-            }
-
-            throw new Error(data.error || ("HTTP " + response.status));
-        }
-
-        renderInfoFields(data.fields);
-    } catch (error) {
-        if (requestedPath === selectedDevicePath) {
-            infoGrid.innerHTML = "";
-            infoErrorBox.textContent =
-                "Nem sikerült kiolvasni az eszközt:\n" +
-                error.message;
-            infoErrorBox.style.display = "block";
-        }
-    } finally {
-        if (requestedPath === selectedDevicePath) {
-            infoLoading.style.display = "none";
-            refreshInfoButton.disabled = false;
-        }
-
-        infoBusy = false;
-    }
+function refreshDeviceInfo() {
+    const device = currentDevice();
+    if (!device) return;
+    const fields = device.metadata?.fields || [{label:"Serial number", value:device.serial_number}];
+    renderInfoFields([{label:"Connection", value:device.connected ? "Connected" : "Offline"},
+                      {label:"Saved measurements", value:String(device.saved_count)}, ...fields]);
 }
-
 
 function updateConfigPreview() {
-    const intervalMinutes = Number(sampleInterval.value);
-
-    if (!Number.isFinite(intervalMinutes) || intervalMinutes <= 0) {
-        recordsPerDay.textContent = "—";
-        recordsPerYear.textContent = "—";
-        memoryDuration.textContent = "—";
+    const seconds = intervalSeconds();
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+        durationDays.textContent = durationMonths.textContent = durationYears.textContent = "—";
         return;
     }
-
-    const perDay = 1440 / intervalMinutes;
-    const perYear = perDay * 365;
-    const yearsCapacity = currentCapacity / perYear;
-
-    recordsPerDay.textContent =
-        perDay.toLocaleString("hu-HU", { maximumFractionDigits: 2 });
-
-    recordsPerYear.textContent =
-        Math.ceil(perYear).toLocaleString("hu-HU");
-
-    memoryDuration.textContent =
-        yearsCapacity.toLocaleString(
-            "hu-HU",
-            {
-                minimumFractionDigits: 2,
-                maximumFractionDigits: 2
-            }
-        ) + " év";
+    const days = currentCapacity * seconds / 86400;
+    durationDays.textContent = days.toLocaleString("en-US", {maximumFractionDigits:2});
+    durationMonths.textContent = (days / 30.4375).toLocaleString("en-US", {maximumFractionDigits:2});
+    durationYears.textContent = (days / 365.25).toLocaleString("en-US", {maximumFractionDigits:2});
 }
-
-
 
 function showSafetyConfirm({
     title,
     message,
     okSide = "right",
     okLabel = "OK",
-    cancelLabel = "Mégse",
+    cancelLabel = "Cancel",
     danger = false
 }) {
     return new Promise(resolve => {
@@ -4449,7 +4504,7 @@ function showSafetyConfirm({
             onKeyDown
         );
 
-        // Mindkét ablaknál a Mégse kap fókuszt.
+        // Mindkét ablaknál a Cancel kap fókuszt.
         // Így véletlen Enter sem tud destruktív műveletet indítani.
         cancelButton.focus();
     });
@@ -4457,15 +4512,14 @@ function showSafetyConfirm({
 
 
 function updateConfigSaveState() {
-    const intervalMinutes = Number(sampleInterval.value);
+    const seconds = intervalSeconds();
 
     const intervalValid =
-        Number.isInteger(intervalMinutes) &&
-        intervalMinutes >= 1 &&
-        intervalMinutes <= 1440;
+        Number.isInteger(seconds) && seconds >= 10 && seconds <= 86400 && seconds % 10 === 0;
 
     saveConfigButton.disabled =
         !configLoaded ||
+        !currentDevice()?.connected ||
         !intervalValid ||
         configBusy;
 }
@@ -4474,15 +4528,18 @@ function updateConfigSaveState() {
 function renderConfig(data) {
     currentCapacity = data.capacity;
     currentRecordCount = data.record_count;
+    currentSessionId = data.session_id;
 
-    const minutes = Number(data.interval_minutes);
-
-    if (Number.isFinite(minutes)) {
-        sampleInterval.value =
-            Number.isInteger(minutes)
-            ? String(minutes)
-            : String(Math.round(minutes * 100) / 100);
-    }
+    const seconds = Number(data.interval_seconds);
+    intervalUnit.value = seconds % 3600 === 0 ? "3600" : seconds % 60 === 0 ? "60" : "1";
+    sampleInterval.value = String(seconds / Number(intervalUnit.value));
+    temperatureUnit.value = data.temperature_unit === "F" ? "F" : "C";
+    probeSelection.value = data.probe === "external" ? "external" : "internal";
+    probeInternal.checked = probeSelection.value === "internal";
+    probeExternal.checked = probeSelection.value === "external";
+    temperatureUnit.dataset.previousUnit = temperatureUnit.value;
+    alarmHigh.value = data.alarm_high;
+    alarmLow.value = data.alarm_low;
 
     allowButtonStop.checked = Boolean(data.button_stop);
     allowSoftwareStop.checked = Boolean(data.software_stop);
@@ -4495,7 +4552,7 @@ function renderConfig(data) {
             || data.capacity === undefined
         )
         ? "-"
-        : Number(data.capacity).toLocaleString("hu-HU") + " mérés";
+        : Number(data.capacity).toLocaleString("en-US") + " measurements";
 
     configRecordCount.textContent =
         (
@@ -4503,14 +4560,14 @@ function renderConfig(data) {
             || data.record_count === undefined
         )
         ? "-"
-        : Number(data.record_count).toLocaleString("hu-HU");
+        : Number(data.record_count).toLocaleString("en-US");
 
     if (Number(data.record_count) === 0) {
-        configAllowed.textContent = "Igen";
+        configAllowed.textContent = "Yes";
         configAllowed.className = "preview-value status-value-ok";
         configWarningBox.style.display = "none";
     } else {
-        configAllowed.textContent = "Igen, kettős megerősítéssel";
+        configAllowed.textContent = "Yes, with confirmation";
         configAllowed.className = "preview-value status-value-blocked";
 
         configWarningBox.textContent = data.blocked_reason;
@@ -4524,14 +4581,15 @@ function renderConfig(data) {
 
 
 async function loadDeviceConfig() {
-    if (!selectedDevicePath || configBusy) {
+    if (!currentDevice()?.connected || configBusy) {
         return;
     }
 
     configBusy = true;
     configLoaded = false;
 
-    const requestedPath = selectedDevicePath;
+    const requestedSerial = selectedSerial;
+    const requestedPath = currentDevice()?.path;
 
     configLoading.style.display = "block";
     reloadConfigButton.disabled = true;
@@ -4548,7 +4606,7 @@ async function loadDeviceConfig() {
 
         const data = await response.json();
 
-        if (requestedPath !== selectedDevicePath) {
+        if (requestedSerial !== selectedSerial) {
             return;
         }
 
@@ -4558,9 +4616,9 @@ async function loadDeviceConfig() {
                 data.code === "permission_denied"
             ) {
                 throw new Error(
-                    "Nincs jogosultság a HID eszköz konfigurációjának "
-                    + "beolvasásához. Nyisd meg az Eszköz információk tabot "
-                    + "és állítsd be az USB-jogosultságot."
+                    "Cannot access the logger settings. "
+                    + "Open the Device information tab "
+                    + "and check USB access."
                 );
             }
 
@@ -4570,11 +4628,11 @@ async function loadDeviceConfig() {
         renderConfig(data);
     } catch (error) {
         configErrorBox.textContent =
-            "Nem sikerült beolvasni a konfigurációt:\n" +
+            "Could not read the settings:\n" +
             error.message;
         configErrorBox.style.display = "block";
     } finally {
-        if (requestedPath === selectedDevicePath) {
+        if (requestedSerial === selectedSerial) {
             configLoading.style.display = "none";
             reloadConfigButton.disabled = false;
         }
@@ -4587,53 +4645,51 @@ async function loadDeviceConfig() {
 
 async function saveDeviceConfig() {
     if (
-        !selectedDevicePath
+        !selectedSerial
         || configBusy
         || !configLoaded
     ) {
         return;
     }
 
-    const intervalMinutes = Number(
-        sampleInterval.value
-    );
-
-    if (
-        !Number.isInteger(intervalMinutes)
-        || intervalMinutes < 1
-        || intervalMinutes > 1440
-    ) {
-        configErrorBox.textContent =
-            "A mintavételi időköz 1 és 1440 közötti egész perc legyen.";
+    const seconds = intervalSeconds();
+    if (!Number.isInteger(seconds) || seconds < 10 || seconds > 86400 || seconds % 10 !== 0) {
+        configErrorBox.textContent = "Choose 10 seconds to 24 hours, in steps of 10 seconds.";
         configErrorBox.style.display = "block";
         return;
     }
 
-    const destructive =
-        Number(currentRecordCount) > 0;
+    const requestedSerial = selectedSerial;
+    const requestedPath = currentDevice()?.path;
+    const confirmedRecordCount = Number(currentRecordCount);
+    const confirmedSessionId = currentSessionId;
+    const destructive = confirmedRecordCount > 0;
 
     const configSummary =
-        `Mintavétel: ${intervalMinutes} perc
-Indítás: kézi (▶ gomb)
-Gombos leállítás: ${allowButtonStop.checked ? "engedélyezve" : "letiltva"}
-Szoftveres leállítás: ${allowSoftwareStop.checked ? "engedélyezve" : "letiltva"}
-Óraszinkron: ${syncClock.checked ? "igen" : "nem"}`;
+        `Logging interval: ${seconds} seconds
+Logger unit: °${temperatureUnit.value}
+Probe: ${probeSelection.value}
+Alarm limits: ${alarmLow.value} to ${alarmHigh.value} °${temperatureUnit.value}
+Start: hold the logger button after unplugging USB
+Button stop: ${allowButtonStop.checked ? "enabled" : "disabled"}
+Software stop: ${allowSoftwareStop.checked ? "enabled" : "disabled"}
+Synchronize clock: ${syncClock.checked ? "yes" : "no"}`;
 
     if (destructive) {
         const firstConfirmed =
             await showSafetyConfirm({
-                title: "1/2 – A tárolt mérések törlődnek",
+                title: "1/2 — Existing measurements will be erased",
                 message:
-                    `A logger jelenleg ${Number(currentRecordCount).toLocaleString("hu-HU")} tárolt mérési rekordot tartalmaz.
+                    `The logger currently has at least ${confirmedRecordCount.toLocaleString("en-US")} stored measurements.
 
-A konfiguráció mentése a gyári FormatCommand műveletet használja, ezért a jelenlegi mérési adatok törlődnek.
+Preparing a new session erases all measurements in this recording session, including new samples collected before saving.
 
-Mielőtt folytatod, ellenőrizd, hogy a fontos méréseket már beolvastad és szükség esetén CSV-be exportáltad.
+Download your measurements and export CSV before continuing.
 
 ${configSummary}`,
                 okSide: "left",
                 okLabel: "OK",
-                cancelLabel: "Mégse",
+                cancelLabel: "Cancel",
                 danger: false
             });
 
@@ -4643,16 +4699,16 @@ ${configSummary}`,
 
         const secondConfirmed =
             await showSafetyConfirm({
-                title: "2/2 – Végleges jóváhagyás",
+                title: "2/2 — Confirm erasing measurements",
                 message:
-                    `Ez a második, végleges megerősítés.
+                    `This is the final confirmation.
 
-A következő OK kattintás után a program elküldi a 6 SetParameter packetet és a FormatCommandot. A logger ${Number(currentRecordCount).toLocaleString("hu-HU")} jelenlegi rekordja várhatóan törlődik.
+Clicking OK will save settings and erase all measurements in this recording session, including samples collected while you configure it.
 
-A mentés után a mérés NEM indul el automatikusan. A készüléket ezután a ▶ gomb hosszú nyomásával lehet új mérési ciklusra indítani.`,
+After saving, unplug USB and hold the logger button for 5 seconds to begin recording.`,
                 okSide: "right",
                 okLabel: "OK",
-                cancelLabel: "Mégse",
+                cancelLabel: "Cancel",
                 danger: true
             });
 
@@ -4662,16 +4718,16 @@ A mentés után a mérés NEM indul el automatikusan. A készüléket ezután a 
     } else {
         const confirmed =
             await showSafetyConfirm({
-                title: "Konfiguráció mentése",
+                title: "Save and prepare logging",
                 message:
                     `${configSummary}
 
-A mérés ettől nem indul el automatikusan.
+After saving, unplug USB and hold the logger button for 5 seconds to begin recording.
 
-A program az ElitechLog Win V8.0.5.0 visszafejtett gyári save-flow-ját használja.`,
+Settings and the clock will be saved before preparing the logger.`,
                 okSide: "right",
                 okLabel: "OK",
-                cancelLabel: "Mégse",
+                cancelLabel: "Cancel",
                 danger: false
             });
 
@@ -4680,14 +4736,15 @@ A program az ElitechLog Win V8.0.5.0 visszafejtett gyári save-flow-ját haszná
         }
     }
 
+    if (selectedSerial !== requestedSerial || currentSessionId !== confirmedSessionId) {
+        configErrorBox.textContent = "The selected recording session changed. Reload the settings and confirm again.";
+        configErrorBox.style.display = "block";
+        return;
+    }
     configBusy = true;
     saveConfigButton.disabled = true;
     reloadConfigButton.disabled = true;
     clearConfigMessages();
-
-    const requestedPath = selectedDevicePath;
-    const confirmedRecordCount =
-        Number(currentRecordCount);
 
     try {
         const response = await fetch(
@@ -4700,13 +4757,17 @@ A program az ElitechLog Win V8.0.5.0 visszafejtett gyári save-flow-ját haszná
                 },
                 body: JSON.stringify({
                     path: requestedPath,
-                    interval_minutes: intervalMinutes,
+                    interval_seconds: seconds,
+                    temperature_unit: temperatureUnit.value,
+                    probe: probeSelection.value,
+                    alarm_high: Number(alarmHigh.value),
+                    alarm_low: Number(alarmLow.value),
                     sync_clock: syncClock.checked,
                     button_stop: allowButtonStop.checked,
                     software_stop: allowSoftwareStop.checked,
                     allow_data_loss: destructive,
-                    expected_record_count:
-                        confirmedRecordCount
+                    expected_record_count: confirmedRecordCount,
+                    expected_session_id: confirmedSessionId
                 })
             }
         );
@@ -4723,18 +4784,21 @@ A program az ElitechLog Win V8.0.5.0 visszafejtett gyári save-flow-ját haszná
         configSuccessBox.textContent =
             (
                 destructive
-                ? `${confirmedRecordCount.toLocaleString("hu-HU")} korábbi rekord törlését jóváhagytad. `
+                ? `${Number(data.record_count_before_save).toLocaleString("en-US")} measurements were erased from the confirmed session. `
                 : ""
             )
             + data.message
-            + " Készülékidő: "
+            + " Logger time: "
             + data.device_time
             + " "
             + (data.persistence_note || "");
 
         configSuccessBox.style.display = "block";
 
-        // Mentés után egyszer visszaolvassuk a teljes konfigurációt.
+        resetMeasurementView();
+        displayUnit.value = temperatureUnit.value;
+        try { localStorage.setItem("elitechTemperatureUnit", displayUnit.value); } catch (_) {}
+        // Read back the complete configuration after preparing the logger.
         configBusy = false;
         await loadDeviceConfig();
 
@@ -4742,11 +4806,11 @@ A program az ElitechLog Win V8.0.5.0 visszafejtett gyári save-flow-ját haszná
         configSuccessBox.textContent =
             (
                 destructive
-                ? `${confirmedRecordCount.toLocaleString("hu-HU")} korábbi rekord törlését jóváhagytad. `
+                ? `${Number(data.record_count_before_save).toLocaleString("en-US")} measurements were erased from the confirmed session. `
                 : ""
             )
             + data.message
-            + " Készülékidő: "
+            + " Logger time: "
             + data.device_time
             + " "
             + (data.persistence_note || "");
@@ -4755,7 +4819,7 @@ A program az ElitechLog Win V8.0.5.0 visszafejtett gyári save-flow-ját haszná
 
     } catch (error) {
         configErrorBox.textContent =
-            "A konfiguráció mentése nem sikerült:\n"
+            "Could not prepare logging:\n"
             + error.message;
         configErrorBox.style.display = "block";
     } finally {
@@ -4772,13 +4836,13 @@ function formatTemperature(value) {
         return "—";
     }
 
-    return Number(value).toLocaleString(
-        "hu-HU",
+    return displayTemperature(Number(value)).toLocaleString(
+        "en-US",
         {
             minimumFractionDigits: 1,
             maximumFractionDigits: 1
         }
-    ) + " °C";
+    ) + " °" + displayUnit.value;
 }
 
 
@@ -4788,7 +4852,7 @@ function formatHumidity(value) {
     }
 
     return Number(value).toLocaleString(
-        "hu-HU",
+        "en-US",
         {
             minimumFractionDigits: 1,
             maximumFractionDigits: 1
@@ -4804,9 +4868,9 @@ function renderMeasurementTable(records) {
         const row = document.createElement("tr");
         const cell = document.createElement("td");
 
-        cell.colSpan = 6;
+        cell.colSpan = 7;
         cell.className = "measurement-empty";
-        cell.textContent = "A loggerben nincs megjeleníthető mérési rekord.";
+        cell.textContent = "No measurements in this time range.";
 
         row.appendChild(cell);
         measurementTableBody.appendChild(row);
@@ -4816,9 +4880,9 @@ function renderMeasurementTable(records) {
     for (const record of records) {
         const row = document.createElement("tr");
 
-        if (record.status === "Értelmezési hiba") {
+        if (record.status === "Parse error") {
             row.className = "error-row";
-        } else if (record.status !== "Mérés") {
+        } else if (record.status !== "Measurement") {
             row.className = "event-row";
         }
 
@@ -4827,6 +4891,7 @@ function renderMeasurementTable(records) {
             record.timestamp || "—",
             formatTemperature(record.temperature),
             formatHumidity(record.humidity),
+            record.probe || "unknown",
             record.status || "—",
             (
                 Array.isArray(record.flags) && record.flags.length
@@ -4838,14 +4903,15 @@ function renderMeasurementTable(records) {
         values.forEach((value, index) => {
             const cell = document.createElement("td");
             cell.textContent = String(value);
+            if (index === 4) { cell.style.color = probeColor(record.probe); cell.style.fontWeight = "600"; }
 
             if (index === 0 || index === 2 || index === 3) {
                 cell.className = "numeric";
             }
 
             if (
-                record.status === "Értelmezési hiba"
-                && index === 5
+                record.status === "Parse error"
+                && index === 6
                 && record.raw_hex
             ) {
                 cell.textContent =
@@ -4890,10 +4956,15 @@ function parseMeasurementTimestamp(timestamp) {
 
 function formatChartAxisLabel(timeMs, spanMs) {
     const date = new Date(timeMs);
+    if (spanMs <= 5 * 60 * 1000) {
+        return new Intl.DateTimeFormat("en-US", {
+            hour: "2-digit", minute: "2-digit", second: "2-digit"
+        }).format(date);
+    }
 
     if (spanMs <= 36 * 60 * 60 * 1000) {
         return new Intl.DateTimeFormat(
-            "hu-HU",
+            "en-US",
             {
                 hour: "2-digit",
                 minute: "2-digit"
@@ -4903,7 +4974,7 @@ function formatChartAxisLabel(timeMs, spanMs) {
 
     if (spanMs <= 10 * 24 * 60 * 60 * 1000) {
         return new Intl.DateTimeFormat(
-            "hu-HU",
+            "en-US",
             {
                 month: "2-digit",
                 day: "2-digit",
@@ -4915,7 +4986,7 @@ function formatChartAxisLabel(timeMs, spanMs) {
 
     if (spanMs <= 90 * 24 * 60 * 60 * 1000) {
         return new Intl.DateTimeFormat(
-            "hu-HU",
+            "en-US",
             {
                 month: "short",
                 day: "2-digit"
@@ -4925,7 +4996,7 @@ function formatChartAxisLabel(timeMs, spanMs) {
 
     if (spanMs <= 550 * 24 * 60 * 60 * 1000) {
         return new Intl.DateTimeFormat(
-            "hu-HU",
+            "en-US",
             {
                 year: "numeric",
                 month: "short"
@@ -4934,7 +5005,7 @@ function formatChartAxisLabel(timeMs, spanMs) {
     }
 
     return new Intl.DateTimeFormat(
-        "hu-HU",
+        "en-US",
         {
             year: "numeric"
         }
@@ -4944,7 +5015,7 @@ function formatChartAxisLabel(timeMs, spanMs) {
 
 function formatChartTooltipTime(timeMs) {
     return new Intl.DateTimeFormat(
-        "hu-HU",
+        "en-US",
         {
             year: "numeric",
             month: "2-digit",
@@ -4997,7 +5068,7 @@ function renderMeasurementChart(records) {
     const chartData = records
         .filter(
             record =>
-                record.status === "Mérés"
+                record.status === "Measurement"
                 && record.timestamp
                 && record.temperature !== null
                 && Number.isFinite(Number(record.temperature))
@@ -5006,7 +5077,7 @@ function renderMeasurementChart(records) {
             record => ({
                 ...record,
                 time: parseMeasurementTimestamp(record.timestamp),
-                temperatureNumber: Number(record.temperature)
+                temperatureNumber: displayTemperature(Number(record.temperature))
             })
         )
         .filter(
@@ -5016,39 +5087,22 @@ function renderMeasurementChart(records) {
             (a, b) => a.time - b.time
         );
 
-    if (chartData.length < 2) {
-        measurementChartWrap.style.display = "none";
-        measurementChart.innerHTML = "";
-        return;
-    }
-
-    const minTime = chartData[0].time;
-    const maxTime = chartData[chartData.length - 1].time;
+    const minTime = measurementRange?.start ?? chartData[0]?.time ?? Date.now() - 3600000;
+    const maxTime = measurementRange?.end ?? Math.max(minTime + 1000, (chartData[chartData.length - 1]?.time ?? Date.now()) + 1000);
     const timeSpan = Math.max(1, maxTime - minTime);
 
     const temperatures = chartData.map(
         record => record.temperatureNumber
     );
 
-    let minTemp = Math.min(...temperatures);
-    let maxTemp = Math.max(...temperatures);
+    let minTemp = temperatures.reduce((a, b) => Math.min(a, b), Infinity);
+    let maxTemp = temperatures.reduce((a, b) => Math.max(a, b), -Infinity);
 
+    if (!temperatures.length) { minTemp = 0; maxTemp = 1; }
     if (minTemp === maxTemp) {
         minTemp -= 0.5;
         maxTemp += 0.5;
     }
-
-    const maxPolylinePoints = 1500;
-    const stride = Math.max(
-        1,
-        Math.ceil(chartData.length / maxPolylinePoints)
-    );
-
-    const lineData = chartData.filter(
-        (_, index) =>
-            index % stride === 0
-            || index === chartData.length - 1
-    );
 
     const width = 1000;
     const height = 300;
@@ -5067,7 +5121,7 @@ function renderMeasurementChart(records) {
     svg.setAttribute("role", "img");
     svg.setAttribute(
         "aria-label",
-        "Interaktív hőmérséklet-idősor"
+        "Interactive temperature chart"
     );
 
     const xForTime = time =>
@@ -5143,12 +5197,12 @@ function renderMeasurementChart(records) {
             left - 9,
             y + 4,
             value.toLocaleString(
-                "hu-HU",
+                "en-US",
                 {
                     minimumFractionDigits: 1,
                     maximumFractionDigits: 1
                 }
-            ) + " °C",
+            ) + " °" + displayUnit.value,
             "end"
         );
     }
@@ -5195,30 +5249,34 @@ function renderMeasurementChart(records) {
         );
     }
 
+    if (!chartData.length) addText(width / 2, height / 2, "No measurements in this time range", "middle", "14");
+
     // Temperature line.
-    const polyline = document.createElementNS(ns, "polyline");
+    const groups = new Map();
+    for (const record of chartData) {
+        const key = `${record.session_id || "recording"}:${record.probe || "unknown"}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(record);
+    }
+    const stride = Math.max(1, Math.ceil(chartData.length / 1500));
+    for (const records of groups.values()) {
+        const points = records.filter((_, i) => i === 0 || i % stride === 0 || i === records.length - 1);
+        const polyline = document.createElementNS(ns, "polyline");
+        polyline.setAttribute("points", points.map(record => `${xForTime(record.time).toFixed(2)},${yForTemperature(record.temperatureNumber).toFixed(2)}`).join(" "));
+        polyline.setAttribute("fill", "none");
+        polyline.setAttribute("stroke", probeColor(records[0].probe));
+        polyline.setAttribute("stroke-width", "2");
+        polyline.setAttribute("vector-effect", "non-scaling-stroke");
+        svg.appendChild(polyline);
+        if (records.length === 1) {
+            const point = document.createElementNS(ns, "circle");
+            point.setAttribute("cx", xForTime(records[0].time));
+            point.setAttribute("cy", yForTemperature(records[0].temperatureNumber));
+            point.setAttribute("r", "4"); point.setAttribute("fill", probeColor(records[0].probe));
+            svg.appendChild(point);
+        }
+    }
 
-    polyline.setAttribute(
-        "points",
-        lineData
-            .map(
-                record =>
-                    `${xForTime(record.time).toFixed(2)},${yForTemperature(record.temperatureNumber).toFixed(2)}`
-            )
-            .join(" ")
-    );
-
-    polyline.setAttribute("fill", "none");
-    polyline.setAttribute("stroke", "#2457d6");
-    polyline.setAttribute("stroke-width", "2");
-    polyline.setAttribute(
-        "vector-effect",
-        "non-scaling-stroke"
-    );
-
-    svg.appendChild(polyline);
-
-    // Hover line.
     const hoverLine = document.createElementNS(ns, "line");
     hoverLine.setAttribute("stroke", "#5d6570");
     hoverLine.setAttribute("stroke-width", "1");
@@ -5280,10 +5338,58 @@ function renderMeasurementChart(records) {
     hoverOverlay.setAttribute("height", plotHeight);
     hoverOverlay.setAttribute("fill", "transparent");
     hoverOverlay.style.pointerEvents = "all";
+    hoverOverlay.style.touchAction = "none";
+    const selection = document.createElementNS(ns, "rect");
+    selection.setAttribute("y", top);
+    selection.setAttribute("height", plotHeight);
+    selection.setAttribute("fill", "#2563eb");
+    selection.setAttribute("fill-opacity", "0.18");
+    selection.setAttribute("stroke", "#2563eb");
+    selection.style.pointerEvents = "none";
+    selection.style.display = "none";
+    svg.appendChild(selection);
+    let dragStart = null;
+    const plotX = event => {
+        const bounds = svg.getBoundingClientRect();
+        return Math.max(left, Math.min(width - right, (event.clientX - bounds.left) / bounds.width * width));
+    };
+    const timeAtX = x => minTime + (x - left) / plotWidth * timeSpan;
+    hoverOverlay.addEventListener("pointerdown", event => {
+        if (event.button !== undefined && event.button !== 0) return;
+        event.preventDefault();
+        dragStart = plotX(event);
+        hoverOverlay.setPointerCapture(event.pointerId);
+        selection.setAttribute("x", dragStart);
+        selection.setAttribute("width", 0);
+        selection.style.display = "";
+    });
+    hoverOverlay.addEventListener("pointermove", event => {
+        if (dragStart === null) return;
+        const x = plotX(event);
+        selection.setAttribute("x", Math.min(dragStart, x));
+        selection.setAttribute("width", Math.abs(x - dragStart));
+        hoverLine.style.display = hoverCircle.style.display = tooltipGroup.style.display = "none";
+    });
+    hoverOverlay.addEventListener("pointerup", event => {
+        if (dragStart === null) return;
+        const x = plotX(event), first = dragStart;
+        dragStart = null;
+        selection.style.display = "none";
+        hoverOverlay.releasePointerCapture(event.pointerId);
+        if (Math.abs(x - first) >= 6) {
+            setMeasurementRange(timeAtX(Math.min(x, first)), timeAtX(Math.max(x, first)));
+        }
+    });
+    hoverOverlay.addEventListener("pointercancel", () => {
+        dragStart = null;
+        selection.style.display = "none";
+    });
+    hoverOverlay.addEventListener("dblclick", () => zoomMeasurementTime(2));
 
     hoverOverlay.addEventListener(
         "mousemove",
         event => {
+            if (dragStart !== null) return;
             const bounds = svg.getBoundingClientRect();
 
             const mouseX =
@@ -5319,6 +5425,7 @@ function renderMeasurementChart(records) {
             hoverLine.setAttribute("y2", top + plotHeight);
             hoverLine.style.display = "";
 
+            hoverCircle.setAttribute("fill", probeColor(nearest.probe));
             hoverCircle.setAttribute("cx", pointX);
             hoverCircle.setAttribute("cy", pointY);
             hoverCircle.style.display = "";
@@ -5328,11 +5435,11 @@ function renderMeasurementChart(records) {
 
             tooltipTemperature.textContent =
                 formatTemperature(
-                    nearest.temperatureNumber
+                    nearest.temperature
                 );
 
             tooltipIndex.textContent =
-                "Mérés #" + nearest.index;
+                (nearest.probe || "unknown") + " probe · #" + nearest.index;
 
             const tooltipWidth = 210;
             const tooltipHeight = 70;
@@ -5383,16 +5490,19 @@ function renderMeasurementSummary(data) {
     const records = data.records || [];
 
     measurementStoredCount.textContent =
-        Number(data.stored_count || 0).toLocaleString("hu-HU");
+        Number(data.stored_count || 0).toLocaleString("en-US");
 
     measurementLoadedCount.textContent =
-        Number(data.loaded_count || 0).toLocaleString("hu-HU");
+        Number(data.loaded_count || 0).toLocaleString("en-US");
 
     const timedRecords = records.filter(
         record => Boolean(record.timestamp)
     );
 
-    if (timedRecords.length > 0) {
+    if (measurementRange) {
+        measurementPeriod.textContent = localDateTime(measurementRange.start).replace("T", " ")
+            + " → " + localDateTime(measurementRange.end).replace("T", " ");
+    } else if (timedRecords.length > 0) {
         measurementPeriod.textContent =
             timedRecords[0].timestamp
             + " → "
@@ -5404,7 +5514,7 @@ function renderMeasurementSummary(data) {
     const temperatures = records
         .filter(
             record =>
-                record.status === "Mérés"
+                record.status === "Measurement"
                 && record.temperature !== null
                 && Number.isFinite(Number(record.temperature))
         )
@@ -5419,8 +5529,8 @@ function renderMeasurementSummary(data) {
         return;
     }
 
-    const minimum = Math.min(...temperatures);
-    const maximum = Math.max(...temperatures);
+    const minimum = temperatures.reduce((a, b) => Math.min(a, b), Infinity);
+    const maximum = temperatures.reduce((a, b) => Math.max(a, b), -Infinity);
     const average =
         temperatures.reduce((sum, value) => sum + value, 0)
         / temperatures.length;
@@ -5432,6 +5542,7 @@ function renderMeasurementSummary(data) {
 
 
 function renderMeasurements(data) {
+    lastMeasurementData = data;
     loadedMeasurementRecords = Array.isArray(data.records)
         ? data.records
         : [];
@@ -5447,94 +5558,102 @@ function renderMeasurements(data) {
 }
 
 
-async function loadDeviceMeasurements() {
-    if (!selectedDevicePath || measurementsBusy) {
-        return;
-    }
-
-    measurementsBusy = true;
-    clearMeasurementMessages();
-
-    const requestedPath = selectedDevicePath;
-    const limit = Number(measurementLimit.value);
-
-    measurementsLoading.style.display = "block";
-    reloadMeasurementsButton.disabled = true;
-    exportCsvButton.disabled = true;
-
-    try {
-        const response = await fetch(
-            "/api/device-records?path="
-            + encodeURIComponent(requestedPath)
-            + "&limit="
-            + encodeURIComponent(String(limit))
-            + "&t="
-            + Date.now()
-        );
-
-        const data = await response.json();
-
-        if (requestedPath !== selectedDevicePath) {
-            return;
-        }
-
-        if (!response.ok) {
-            if (
-                response.status === 403
-                && data.code === "permission_denied"
-            ) {
-                throw new Error(
-                    "Nincs jogosultság a HID eszköz rekordjainak "
-                    + "beolvasásához. Nyisd meg az Eszköz információk "
-                    + "tabot és állítsd be az USB-jogosultságot."
-                );
-            }
-
-            throw new Error(
-                data.error || ("HTTP " + response.status)
-            );
-        }
-
-        renderMeasurements(data);
-
-        if (Number(data.stored_count) === 0) {
-            measurementsSuccessBox.textContent =
-                "A logger jelenleg nem tartalmaz mérési rekordot.";
-        } else if (
-            Number(data.loaded_count)
-            < Number(data.stored_count)
-        ) {
-            measurementsSuccessBox.textContent =
-                data.loaded_count.toLocaleString("hu-HU")
-                + " rekord betöltve a tárolt "
-                + data.stored_count.toLocaleString("hu-HU")
-                + " rekordból.";
-        } else {
-            measurementsSuccessBox.textContent =
-                data.loaded_count.toLocaleString("hu-HU")
-                + " mérési rekord betöltve.";
-        }
-
-        measurementsSuccessBox.style.display = "block";
-
-    } catch (error) {
-        measurementsErrorBox.textContent =
-            "A mérési rekordok beolvasása nem sikerült:\n"
-            + error.message;
-        measurementsErrorBox.style.display = "block";
-    } finally {
-        if (requestedPath === selectedDevicePath) {
-            measurementsLoading.style.display = "none";
-            reloadMeasurementsButton.disabled = false;
-            exportCsvButton.disabled =
-                !measurementsLoaded
-                || loadedMeasurementRecords.length === 0;
-        }
-
-        measurementsBusy = false;
-    }
+// Bounds use local wall time, matching timestamps saved from the logger.
+function localDateTime(time) {
+    const d = new Date(time), pad = n => String(n).padStart(2, "0");
+    return `${String(d.getFullYear()).padStart(4, "0")}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
+function setMeasurementRange(start, end, preset = "custom", reload = true) {
+    start = Math.floor(start / 1000) * 1000;
+    end = Math.ceil(end / 1000) * 1000;
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end - start < 1000
+        || new Date(start).getFullYear() < 1 || new Date(end).getFullYear() > 9999) {
+        measurementsErrorBox.textContent = "Choose a valid start and end time, with the end after the start.";
+        measurementsErrorBox.style.display = "block";
+        return false;
+    }
+    measurementRange = {start, end};
+    measurementRangePreset.value = preset;
+    measurementStart.value = localDateTime(start);
+    measurementEnd.value = localDateTime(end);
+    clearMeasurementMessages();
+    if (reload) { resetMeasurementView(); loadDeviceMeasurements(); }
+    return true;
+}
+
+function useMeasurementPreset(preset, reload = true) {
+    if (preset === "custom") return;
+    if (preset === "all") {
+        measurementRange = null;
+        measurementStart.value = measurementEnd.value = "";
+        measurementRangePreset.value = "all";
+        if (reload) { resetMeasurementView(); loadDeviceMeasurements(); }
+        return;
+    }
+    const start = new Date(), end = new Date();
+    start.setHours(0, 0, 0, 0);
+    end.setHours(0, 0, 0, 0);
+    if (preset === "yesterday") start.setDate(start.getDate() - 1);
+    else {
+        end.setDate(end.getDate() + 1);
+        if (preset === "week") start.setDate(start.getDate() - 6);
+        if (preset === "month") start.setDate(start.getDate() - 29);
+    }
+    setMeasurementRange(start.getTime(), end.getTime(), preset, reload);
+}
+
+function applyMeasurementRange() {
+    setMeasurementRange(parseMeasurementTimestamp(measurementStart.value.replace("T", " ").padEnd(19, ":00")),
+        parseMeasurementTimestamp(measurementEnd.value.replace("T", " ").padEnd(19, ":00")));
+}
+
+function zoomMeasurementTime(factor) {
+    let range = measurementRange;
+    if (!range) {
+        const times = loadedMeasurementRecords.map(r => parseMeasurementTimestamp(r.timestamp)).filter(Number.isFinite);
+        if (times.length) range = {start: times.reduce((a,b) => Math.min(a,b), Infinity), end: times.reduce((a,b) => Math.max(a,b), -Infinity) + 1000};
+        else { useMeasurementPreset("today"); return; }
+    }
+    const middle = (range.start + range.end) / 2;
+    const span = Math.max(1000, (range.end - range.start) * factor);
+    setMeasurementRange(middle - span / 2, middle + span / 2);
+}
+
+async function loadDeviceMeasurements() {
+    if (!selectedSerial) return;
+    const serial = selectedSerial;
+    const request = ++measurementRequestSequence;
+    measurementsBusy = true;
+    clearMeasurementMessages();
+    measurementsLoading.style.display = "block";
+    try {
+        let url = "/api/sensor-records?serial=" + encodeURIComponent(serial);
+        if (measurementRange) {
+            url += "&start=" + encodeURIComponent(localDateTime(measurementRange.start).replace("T", " "))
+                + "&end=" + encodeURIComponent(localDateTime(measurementRange.end).replace("T", " "));
+        }
+        const response = await fetch(url);
+        const data = await response.json();
+        if (request !== measurementRequestSequence || serial !== selectedSerial) return;
+        if (!response.ok) throw new Error(data.error || "Could not load saved measurements.");
+        if (data.serial_number !== serial) throw new Error("The response belongs to another sensor.");
+        renderMeasurements(data);
+        measurementsSuccessBox.textContent = `${data.loaded_count} measurements in the selected time range (${data.stored_count} saved for this sensor).`;
+        measurementsSuccessBox.style.display = "block";
+    } catch (error) {
+        if (request === measurementRequestSequence) {
+            measurementsErrorBox.textContent = error.message;
+            measurementsErrorBox.style.display = "block";
+        }
+    } finally {
+        if (request === measurementRequestSequence) {
+            measurementsBusy = false;
+            measurementsLoading.style.display = "none";
+            updateDeviceHeaders();
+        }
+    }
+}
 
 function csvEscape(value) {
     const text = String(
@@ -5565,26 +5684,29 @@ function exportMeasurementsCsv() {
 
     const rows = [
         [
-            "Sorszám",
-            "Időpont",
-            "Hőmérséklet (°C)",
-            "Páratartalom (%)",
-            "Állapot",
-            "Jelzők",
-            "Nyers rekord"
+            "Logger serial",
+            "Index",
+            "Time",
+            `Temperature (°${displayUnit.value})`,
+            "Humidity (%)",
+            "Probe",
+            "Status",
+            "Flags",
+            "Raw record"
         ]
     ];
 
     for (const record of loadedMeasurementRecords) {
         rows.push(
             [
+                lastMeasurementData?.serial_number || selectedSerial,
                 record.index,
                 record.timestamp || "",
                 (
                     record.temperature === null
                     || record.temperature === undefined
                     ? ""
-                    : Number(record.temperature).toFixed(1)
+                    : displayTemperature(Number(record.temperature)).toFixed(1)
                 ),
                 (
                     record.humidity === null
@@ -5592,6 +5714,7 @@ function exportMeasurementsCsv() {
                     ? ""
                     : Number(record.humidity).toFixed(1)
                 ),
+                record.probe || "unknown",
                 record.status || "",
                 (
                     Array.isArray(record.flags)
@@ -5634,7 +5757,7 @@ function exportMeasurementsCsv() {
 
     link.href = url;
     link.download =
-        "elitech-rc5-meresek-"
+        "elitech-" + (lastMeasurementData?.serial_number || selectedSerial) + "-measurements-"
         + datePart
         + ".csv";
 
@@ -5682,7 +5805,7 @@ async function installPermissionRule() {
         }
     } catch (error) {
         infoErrorBox.textContent =
-            "A jogosultság beállítása nem sikerült:\n"
+            "Could not set up USB access:\n"
             + error.message;
         infoErrorBox.style.display = "block";
     } finally {
@@ -5694,63 +5817,20 @@ async function installPermissionRule() {
 
 function openTab(tabName) {
     activeTab = tabName;
-
-    const infoActive = tabName === "info";
-    const configActive = tabName === "config";
-    const measurementsActive = tabName === "measurements";
-
-    infoTabButton.classList.toggle(
-        "active",
-        infoActive
-    );
-
-    configTabButton.classList.toggle(
-        "active",
-        configActive
-    );
-
-    measurementsTabButton.classList.toggle(
-        "active",
-        measurementsActive
-    );
-
-    infoTabPage.classList.toggle(
-        "active",
-        infoActive
-    );
-
-    configTabPage.classList.toggle(
-        "active",
-        configActive
-    );
-
-    measurementsTabPage.classList.toggle(
-        "active",
-        measurementsActive
-    );
-
+    for (const [name, button, page] of [["info",infoTabButton,infoTabPage], ["config",configTabButton,configTabPage], ["measurements",measurementsTabButton,measurementsTabPage]]) {
+        button.classList.toggle("active", tabName === name);
+        page.classList.toggle("active", tabName === name);
+    }
     updateDeviceHeaders();
-
-    if (!selectedDevicePath) {
-        return;
-    }
-
-    // Csak a kiválasztott tab adatait olvassuk.
-    // Nincs periodikus HID rekord/config/információ frissítés.
-    if (infoActive) {
-        refreshDeviceInfo();
-    } else if (configActive) {
-        loadDeviceConfig();
-    } else if (measurementsActive) {
-        loadDeviceMeasurements();
-    }
+    if (tabName === "measurements") loadDeviceMeasurements();
+    else if (tabName === "config" && currentDevice()?.connected) loadDeviceConfig();
+    else if (tabName === "info") refreshDeviceInfo();
 }
-
 
 function updateComputerTime() {
     computerTime.value =
         new Intl.DateTimeFormat(
-            "hu-HU",
+            "en-US",
             {
                 year: "numeric",
                 month: "2-digit",
@@ -5795,7 +5875,7 @@ saveConfigButton.addEventListener(
 
 reloadMeasurementsButton.addEventListener(
     "click",
-    loadDeviceMeasurements
+    syncSelectedSensor
 );
 
 exportCsvButton.addEventListener(
@@ -5817,7 +5897,40 @@ sampleInterval.addEventListener(
 );
 
 
+saveSensorName.addEventListener("click", renameSelectedSensor);
+probeInternal.addEventListener("change", () => { if (probeInternal.checked) probeSelection.value = "internal"; });
+probeExternal.addEventListener("change", () => { if (probeExternal.checked) probeSelection.value = "external"; });
+measurementRangePreset.addEventListener("change", () => useMeasurementPreset(measurementRangePreset.value));
+for (const input of [measurementStart, measurementEnd]) {
+    input.addEventListener("input", () => { measurementRangePreset.value = "custom"; });
+    input.addEventListener("keydown", event => { if (event.key === "Enter") applyMeasurementRange(); });
+}
+document.getElementById("applyMeasurementRange").addEventListener("click", applyMeasurementRange);
+document.getElementById("measurementZoomIn").addEventListener("click", () => zoomMeasurementTime(0.5));
+document.getElementById("measurementZoomOut").addEventListener("click", () => zoomMeasurementTime(2));
+document.getElementById("measurementToday").addEventListener("click", () => useMeasurementPreset("today"));
+temperatureUnit.addEventListener("change", () => {
+    const oldUnit = temperatureUnit.dataset.previousUnit || "C";
+    if (oldUnit !== temperatureUnit.value) {
+        for (const field of [alarmHigh, alarmLow]) {
+            const value = Number(field.value);
+            if (Number.isFinite(value)) field.value = (temperatureUnit.value === "F" ? value * 9 / 5 + 32 : (value - 32) * 5 / 9).toFixed(1);
+        }
+    }
+    temperatureUnit.dataset.previousUnit = temperatureUnit.value;
+});
+document.getElementById("resetAlarmLimits").addEventListener("click", () => {
+    alarmHigh.value = temperatureUnit.value === "F" ? "140" : "60";
+    alarmLow.value = temperatureUnit.value === "F" ? "-22" : "-30";
+});
+intervalUnit.addEventListener("change", () => { updateConfigPreview(); updateConfigSaveState(); });
+displayUnit.addEventListener("change", () => {
+    try { localStorage.setItem("elitechTemperatureUnit", displayUnit.value); } catch (_) {}
+    if (lastMeasurementData) renderMeasurements(lastMeasurementData);
+});
+
 async function start() {
+    useMeasurementPreset("today", false);
     updateComputerTime();
     updateConfigPreview();
 
@@ -5843,6 +5956,35 @@ start();
 # HTTP szerver
 # ============================================================
 
+def identify_sensor(path):
+    with HID_LOCK:
+        fd = open_device(path)
+        try:
+            return hid_get_parameter(fd, 0, 14)[2:14].decode("ascii").strip("\x00 ")
+        finally:
+            fd.close()
+
+
+def inspect_sensor(path):
+    config = read_device_config(path)
+    info = read_device_info(path)
+    if config["serial_number"] != info["serial_number"]:
+        raise OSError("The logger changed while its identity was being read.")
+    config["fields"] = info["fields"]
+    return config
+
+
+class LocalHTTPServer(ThreadingHTTPServer):
+    # Windows SO_REUSEADDR can allow two active servers on the same port.
+    # Exclusive ownership also makes launching the app twice reopen its page.
+    allow_reuse_address = sys.platform != "win32"
+
+    def server_bind(self):
+        if sys.platform == "win32":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -5862,6 +6004,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_html(self, html):
         html = html.replace("__APP_TOKEN__", APP_TOKEN)
+        html = html.replace("__IS_WINDOWS__", json.dumps(sys.platform == "win32"))
         body = html.encode("utf-8")
 
         self.send_response(200)
@@ -5880,10 +6023,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(content_length)
         except ValueError:
-            raise ValueError("Érvénytelen Content-Length.")
+            raise ValueError("Invalid Content-Length.")
 
         if length < 0 or length > 64 * 1024:
-            raise ValueError("Érvénytelen kérésméret.")
+            raise ValueError("Invalid request size.")
 
         raw = self.rfile.read(length)
 
@@ -5893,14 +6036,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             return json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            raise ValueError("Érvénytelen JSON kérés.")
+            raise ValueError("Invalid JSON request.")
 
     def require_write_token(self):
         token = self.headers.get("X-Elitech-Token", "")
 
         if token != APP_TOKEN:
             self.send_json(
-                {"error": "Érvénytelen vagy hiányzó alkalmazástoken."},
+                {"error": "Invalid or missing application token."},
                 status=403,
             )
             return False
@@ -5914,7 +6057,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(
                 {
                     "error": (
-                        "A kiválasztott RC-5 már nincs csatlakoztatva."
+                        "The selected logger is no longer connected."
                     )
                 },
                 status=404,
@@ -5934,7 +6077,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(
                 {
                     "code": "permission_denied",
-                    "error": "Nincs jogosultság a HID eszköz megnyitásához.",
+                    "error": "Cannot open the logger. Close other logger apps and check the USB connection.",
                 },
                 status=403,
             )
@@ -5967,8 +6110,30 @@ class Handler(BaseHTTPRequestHandler):
             self.send_html(HTML)
             return
 
+        if path == "/api/health":
+            self.send_json({"app": "elitech-hid-webui", "version": APP_VERSION})
+            return
+
+        if path == "/api/sensors":
+            self.send_json({"sensors": SYNC_MANAGER.snapshot() if SYNC_MANAGER else get_history().sensors(),
+                            "database_path": str(get_history().path)})
+            return
+
+        if path == "/api/sensor-records":
+            query = parse_qs(parsed.query)
+            try:
+                self.send_json(get_history().sensor_recording(query.get("serial", [""])[0],
+                    query.get("session_id", ["all"])[0], int(query.get("limit", ["0"])[0]),
+                    start=query.get("start", [None])[0], end=query.get("end", [None])[0]))
+            except ValueError as error:
+                self.send_device_exception(error)
+            return
+
         if path == "/api/devices":
-            self.send_json(scan_devices())
+            try:
+                self.send_json(scan_devices())
+            except (OSError, RuntimeError) as error:
+                self.send_device_exception(error)
             return
 
         if path == "/api/device-info":
@@ -6004,7 +6169,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
             except ValueError:
                 self.send_json(
-                    {"error": "Érvénytelen rekordlimit."},
+                    {"error": "Invalid record limit."},
                     status=400,
                 )
                 return
@@ -6023,6 +6188,19 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as error:
                 self.send_device_exception(error)
 
+            return
+
+        if path == "/api/history":
+            self.send_json(get_history().sessions())
+            return
+
+        if path == "/api/history-records":
+            query = parse_qs(parsed.query)
+            try:
+                self.send_json(get_history().recording(query.get("session_id", [""])[0],
+                                                int(query.get("limit", ["0"])[0])))
+            except (ValueError, OSError) as error:
+                self.send_device_exception(error)
             return
 
         if path == "/api/device-config":
@@ -6051,6 +6229,19 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if not self.require_write_token():
+            return
+
+        if parsed.path in ("/api/sensor-name", "/api/sync"):
+            try:
+                payload = self.read_json_body()
+                serial = payload.get("serial", "")
+                if parsed.path == "/api/sensor-name":
+                    get_history().rename_sensor(serial, payload.get("name"))
+                elif SYNC_MANAGER:
+                    SYNC_MANAGER.request_sync(serial)
+                self.send_json({"ok": True})
+            except (ValueError, OSError) as error:
+                self.send_device_exception(error)
             return
 
         if parsed.path == "/api/install-udev":
@@ -6083,6 +6274,11 @@ class Handler(BaseHTTPRequestHandler):
                 result = apply_device_config(
                     device_path,
                     interval_minutes=payload.get("interval_minutes"),
+                    interval_seconds=payload.get("interval_seconds"),
+                    temperature_unit=payload.get("temperature_unit"),
+                    probe=payload.get("probe"),
+                    alarm_high=payload.get("alarm_high"),
+                    alarm_low=payload.get("alarm_low"),
                     sync_clock=bool(payload.get("sync_clock", True)),
                     button_stop=bool(payload.get("button_stop", False)),
                     software_stop=bool(
@@ -6094,6 +6290,7 @@ class Handler(BaseHTTPRequestHandler):
                     expected_record_count=payload.get(
                         "expected_record_count"
                     ),
+                    expected_session_id=payload.get("expected_session_id"),
                 )
 
                 self.send_json(result)
@@ -6141,15 +6338,53 @@ def open_browser():
 # ============================================================
 
 def main():
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    url = f"http://{HOST}:{PORT}/"
+    global HISTORY, SYNC_MANAGER, HOST, PORT, DEBUG_LOG_PATH
+    parser = argparse.ArgumentParser(description="Elitech USB logger WebUI (Windows/Linux)")
+    parser.add_argument("--no-browser", action="store_true", help="Print the URL without opening a browser")
+    parser.add_argument("--open-browser", action="store_true", help="Open the local UI (desktop use)")
+    parser.add_argument("--config", help="Path to config.json (default: working directory)")
+    parser.add_argument("--database", help="Override database_path from config")
+    args = parser.parse_args()
+    settings = load_settings(args.config)
+    if args.database:
+        settings["database_path"] = args.database
+    HOST, PORT = settings["host"], int(settings["port"])
+    browser_enabled = not args.no_browser and (args.open_browser or settings["open_browser"])
 
+    if sys.platform == "win32":
+        load_hidapi()
+
+    url = f"http://{HOST}:{PORT}/"
+    try:
+        server = LocalHTTPServer((HOST, PORT), Handler)
+    except OSError as bind_error:
+        try:
+            with urlopen(url + "api/health", timeout=1) as response:
+                already_running = json.load(response).get("app") == "elitech-hid-webui"
+        except (OSError, ValueError):
+            already_running = False
+        if not already_running:
+            raise bind_error
+        print(f"Elitech WebUI is already running: {url}")
+        if browser_enabled:
+            open_browser()
+        return
+
+    HISTORY = open_history(settings)
+    DEBUG_LOG_PATH = configured_path(settings["log_path"]) if settings["log_path"] else HISTORY.path.parent / "elitech-debug.log"
+    DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(DEBUG_LOG_PATH, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    LOGGER.addHandler(file_handler)
+    SYNC_MANAGER = SensorSync(HISTORY, scan_devices, inspect_sensor, read_device_records,
+                             settings["sync_interval_seconds"], settings["scan_interval_seconds"], identify=identify_sensor)
+    SYNC_MANAGER.start()
     print()
-    print(f"Elitech RC-5 Manager | {APP_VERSION}")
+    print(f"Elitech USB Logger Manager | {APP_VERSION}")
     print("---------------------------------------------")
     print(f"Web UI: {url}")
     print(f"Debug log: {DEBUG_LOG_PATH}")
-    print("Leállítás: Ctrl+C")
+    print("Stop server: Ctrl+C")
 
     LOGGER.info(
         "APPLICATION START | version=%s | script=%s | url=%s | debug_log=%s",
@@ -6160,16 +6395,18 @@ def main():
     )
     print()
 
-    threading.Thread(
-        target=open_browser,
-        daemon=True,
-    ).start()
+    if browser_enabled:
+        threading.Thread(
+            target=open_browser,
+            daemon=True,
+        ).start()
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nLeállítás...")
+        print("\nStopping...")
     finally:
+        SYNC_MANAGER.stop()
         server.shutdown()
         server.server_close()
 

@@ -1,0 +1,9 @@
+{
+  "database_path": null,
+  "host": "127.0.0.1",
+  "port": 8765,
+  "open_browser": false,
+  "sync_interval_seconds": 10,
+  "scan_interval_seconds": 1,
+  "log_path": null
+}
